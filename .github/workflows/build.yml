@@ -34,12 +34,12 @@ jobs:
         run: |
           pyinstaller SmartSearchAI.spec
 
-      - name: Upload exe as build artifact
+      - name: Upload build folder as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SmartSearchAI-windows-exe
-          path: dist/SmartSearchAI.exe
-          # The exe itself is already a compressed/optimized binary --
-          # zipping it again for the artifact wrapper saves little time
-          # and just adds another zip/unzip step.
-          compression-level: 0
+          name: SmartSearchAI-windows
+          # onedir build -> dist/SmartSearchAI/ is a FOLDER containing
+          # SmartSearchAI.exe plus all its DLLs/data. Upload the whole
+          # thing; upload-artifact zips it automatically for download.
+          path: dist/SmartSearchAI/
+          compression-level: 6
