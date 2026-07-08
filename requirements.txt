@@ -32,6 +32,11 @@ torch
 # feature and was already required by the rest of the app (document
 # reading/writing, UI, etc.) -- listed here too so the build venv has
 # everything the app needs, not just the AI stack.
+# pywin32 -- needed for real Windows Explorer icons (win32gui/win32ui/
+# win32con via SHGetFileInfoW) AND for the Word/PowerPoint/Outlook COM
+# automation elsewhere in the app (win32com.client). Without this, icons
+# silently fall back to emoji and Office automation features are disabled.
+pywin32
 numpy
 Pillow
 pandas
