@@ -13,6 +13,11 @@ sentence-transformers>=3.0
 einops
 huggingface_hub
 
+# BM25 keyword search — separate from the AI/semantic stack above, but was
+# missed in the first version of this file, which is why the built exe had
+# every BM25 search path fail with "No module named 'rank_bm25'".
+rank_bm25
+
 # CPU-only torch build. This is dramatically smaller than the default
 # CUDA-enabled wheel (which bundles multiple GB of CUDA/cuDNN binaries) and
 # is the right choice unless you specifically need GPU inference on the
@@ -27,6 +32,8 @@ torch
 # feature and was already required by the rest of the app (document
 # reading/writing, UI, etc.) -- listed here too so the build venv has
 # everything the app needs, not just the AI stack.
+numpy
+Pillow
 pandas
 python-docx
 pypdf
