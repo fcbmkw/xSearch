@@ -101,10 +101,8 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='SmartSearchAI',
     debug=False,
     bootloader_ignore_signals=False,
@@ -120,4 +118,25 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+# v9.1: onedir instead of onefile. --onefile bundles everything into a
+# single .exe, but that means EVERY launch has to re-extract the whole
+# thing (380MB+ here) into a fresh %TEMP%\_MEIxxxxxx folder before it can
+# even start running -- this was the exact cause of the 20-30s startup
+# delay. onedir instead produces a folder (dist/SmartSearchAI/) with the
+# .exe plus all its DLLs/data sitting right next to it, so launching just
+# loads them directly -- no extraction step, dramatically faster startup.
+# Distribute the whole dist/SmartSearchAI/ folder (zipped) instead of a
+# single .exe file; SmartSearchAI.exe inside that folder is still the
+# thing users double-click.
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='SmartSearchAI',
 )
