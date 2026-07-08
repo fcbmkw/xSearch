@@ -1,0 +1,34 @@
+# v9.0 -- pinned versions for the "fat" build (everything baked into the exe
+# at build time, nothing pip-installed on the user's machine at runtime).
+#
+# transformers is pinned BELOW 5.0 on purpose: jina-embeddings-v3 ships a
+# custom trust_remote_code modeling file (XLMRobertaLoRA) written against
+# the transformers v4.x tied-weights API. transformers v5 changed that
+# internal API, so the custom code crashes with:
+#   'XLMRobertaLoRA' object has no attribute 'all_tied_weights_keys'
+# 4.44+ is required for proper Gemma2 support (bge_gemma2).
+transformers>=4.44,<5
+
+sentence-transformers>=3.0
+einops
+huggingface_hub
+
+# CPU-only torch build. This is dramatically smaller than the default
+# CUDA-enabled wheel (which bundles multiple GB of CUDA/cuDNN binaries) and
+# is the right choice unless you specifically need GPU inference on the
+# target machines. If you DO want CUDA support, remove the --extra-index-url
+# line below and pin a matching torch version + CUDA toolkit instead --
+# talk to Claude about this before changing it, since it affects the whole
+# build pipeline size and the .spec file's collected binaries.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+# --- everything below this line is unrelated to the AI/semantic search
+# feature and was already required by the rest of the app (document
+# reading/writing, UI, etc.) -- listed here too so the build venv has
+# everything the app needs, not just the AI stack.
+pandas
+python-docx
+pypdf
+python-pptx
+xlrd
