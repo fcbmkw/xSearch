@@ -2531,7 +2531,7 @@ class RealtimeSmartSearchApp:
                 img = get_tree_icon_image(path, is_folder=False)
                 name_txt = item[1] if img else get_file_icon(path) + item[1]
                 mt = item[4] if len(item) > 4 and item[4] is not None else get_live_mtime(path)
-                tree.insert("", "end", text="", image=img, values=(
+                tree.insert("", "end", text="", **({"image": img} if img else {}), values=(
                     name_txt, format_size(item[3]), mt,
                     get_file_type(path), os.path.dirname(path), path))
             except Exception:
@@ -2565,7 +2565,7 @@ class RealtimeSmartSearchApp:
                 img = get_tree_icon_image(path, is_folder=True)
                 name_txt = item[1] if img else "📁 " + item[1]
                 mt = item[4] if len(item) > 4 and item[4] is not None else get_live_mtime(path)
-                tree.insert("", "end", text="", image=img, values=(name_txt, mt, path, path))
+                tree.insert("", "end", text="", **({"image": img} if img else {}), values=(name_txt, mt, path, path))
             except Exception:
                 pass
         self._restore_col_widths(tree, widths)
@@ -3829,7 +3829,7 @@ class RealtimeSmartSearchApp:
             try:
                 img = get_tree_icon_image(item[0], False)
                 name_txt = item[0] if img else get_file_icon(item[0], False) + item[0]
-                tree.insert("", tk.END, text="", image=img, values=(
+                tree.insert("", tk.END, text="", **({"image": img} if img else {}), values=(
                     name_txt,
                     format_size(item[1]) if item[1] else "",
                     get_live_mtime(item[0]), get_file_type(item[0]), item[0]))
@@ -3842,7 +3842,7 @@ class RealtimeSmartSearchApp:
             try:
                 img = get_tree_icon_image(item[2], False)
                 name_txt = item[1] if img else get_file_icon(item[2], False) + item[1]
-                tree.insert("", tk.END, text="", image=img, values=(
+                tree.insert("", tk.END, text="", **({"image": img} if img else {}), values=(
                     name_txt,
                     format_size(item[3]) if item[3] else "",
                     get_live_mtime(item[2]), get_file_type(item[2]),
@@ -3856,7 +3856,7 @@ class RealtimeSmartSearchApp:
             try:
                 img = get_tree_icon_image(item[2], True)
                 name_txt = item[1] if img else get_file_icon(item[2], True) + item[1]
-                tree.insert("", tk.END, text="", image=img, values=(name_txt, get_live_mtime(item[2]), item[2], item[2]))
+                tree.insert("", tk.END, text="", **({"image": img} if img else {}), values=(name_txt, get_live_mtime(item[2]), item[2], item[2]))
             except: pass
 
     # ── Layout builder — called for EACH tab_frame independently ─────────────
@@ -4152,7 +4152,10 @@ class RealtimeSmartSearchApp:
             readable_sz = format_size(size) if size else ""
             mtime = get_live_mtime(path)
             ftype = get_file_type(path)
-            tree.insert("", tk.END, text="", image=img, values=(name_txt, readable_sz, mtime, ftype, path))
+            kwargs = dict(text="", values=(name_txt, readable_sz, mtime, ftype, path))
+            if img:
+                kwargs["image"] = img
+            tree.insert("", tk.END, **kwargs)
         elif mode == 1:
             # File Name tab: (type, name, path, size)
             img = get_tree_icon_image(item[2], is_folder=False)
@@ -4160,13 +4163,19 @@ class RealtimeSmartSearchApp:
             readable_sz = format_size(item[3]) if item[3] else ""
             mtime = get_live_mtime(item[2])
             ftype = get_file_type(item[2])
-            tree.insert("", tk.END, text="", image=img, values=(name_txt, readable_sz, mtime, ftype, os.path.dirname(item[2]), item[2]))
+            kwargs = dict(text="", values=(name_txt, readable_sz, mtime, ftype, os.path.dirname(item[2]), item[2]))
+            if img:
+                kwargs["image"] = img
+            tree.insert("", tk.END, **kwargs)
         else:
             # Folder Name tab: (type, name, path, size)
             img = get_tree_icon_image(item[2], is_folder=True)
             name_txt = item[1] if img else get_file_icon(item[2], is_folder=True) + item[1]
             mtime = get_live_mtime(item[2])
-            tree.insert("", tk.END, text="", image=img, values=(name_txt, mtime, item[2], item[2]))
+            kwargs = dict(text="", values=(name_txt, mtime, item[2], item[2]))
+            if img:
+                kwargs["image"] = img
+            tree.insert("", tk.END, **kwargs)
 
     def _draw_search_icon(self, parent, size=18, color=None):
         """v4.9: flat vector magnifying-glass icon drawn on a Canvas — looks
@@ -5677,7 +5686,7 @@ class RealtimeSmartSearchApp:
                     readable_sz = format_size(get_live_size(item[2], item[3]))
                     mtime = get_live_mtime(item[2])
                     ftype = get_file_type(item[2])
-                    tree.insert("", tk.END, text="", image=img, values=(name_txt, readable_sz, mtime, ftype, os.path.dirname(item[2]), item[2]))
+                    tree.insert("", tk.END, text="", **({"image": img} if img else {}), values=(name_txt, readable_sz, mtime, ftype, os.path.dirname(item[2]), item[2]))
                 except Exception:
                     pass
             self._restore_col_widths(tree, widths)
@@ -5773,7 +5782,7 @@ class RealtimeSmartSearchApp:
                     readable_sz = format_size(get_live_size(item[0], 0))
                     mtime = get_live_mtime(item[0])
                     ftype = get_file_type(item[0])
-                    tree.insert("", tk.END, text="", image=img, values=(name_txt, readable_sz, mtime, ftype, item[0]))
+                    tree.insert("", tk.END, text="", **({"image": img} if img else {}), values=(name_txt, readable_sz, mtime, ftype, item[0]))
                 except Exception:
                     pass
             self._update_pane_label(tree, len(filtered), len(source))
