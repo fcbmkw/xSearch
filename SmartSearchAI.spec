@@ -112,7 +112,9 @@ exe = EXE(
                  # machines even more than an uncompressed exe -- leave off.
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False,  # app is stable now -- hide the console window. Requires
+                     # the sys.stdout/stderr None-guard at the top of app.py,
+                     # or every print() call would crash the app instantly.
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
