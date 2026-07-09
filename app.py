@@ -1,10 +1,25 @@
 import sys
+import os
+
+# v9.2: required BEFORE anything else once the .spec is built with
+# console=False (windowed mode, no visible console window). In that mode
+# PyInstaller sets sys.stdout/sys.stderr to None (there is no console to
+# write to) -- but this app calls print() extensively throughout for
+# logging/debugging. Without this guard, the very first print() call would
+# crash the app instantly with "AttributeError: 'NoneType' object has no
+# attribute 'write'", before the GUI even has a chance to open. Redirecting
+# to os.devnull makes every print() a harmless no-op instead. Must run
+# before any other import that might print something at import time.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import math
 import tkinter as tk
 from tkinter import messagebox, ttk, filedialog
 import webbrowser
 import subprocess
-import os
 import re
 import sqlite3
 import threading
@@ -1502,11 +1517,25 @@ class RealtimeSmartSearchApp:
         except Exception:
             return False
 
-    def _ramp_blink_start(self):
-        """Start blinking the ramp-light yellow while an Update DB run is
-        actively scanning/extracting content (the BM25 stage). Call
-        _ramp_blink_stop() once that stage finishes — success snaps to a
-        solid Green (see indexing_worker), failure snaps to solid Red.
+    _RAMP_BLINK_COLORS = {
+        "yellow": ("#ffcc00", "#6b5200"),  # BM25/content indexing stage
+        "green":  ("#4caf50", "#1f4623"),  # AI/semantic embedding stage
+    }
+
+    def _ramp_blink_start(self, color="yellow"):
+        """Start blinking the ramp-light while an Update DB run is actively
+        working. color="yellow" for the BM25/content stage, color="green"
+        for the AI/semantic-embedding stage that follows it — lets you tell
+        the two stages apart at a glance instead of both looking the same.
+        Call _ramp_blink_stop() once all work finishes — success snaps to a
+        solid Green/Blue (see indexing_worker), failure snaps to solid Red.
+
+        Calling this again with a DIFFERENT color while already blinking
+        (e.g. switching from the yellow BM25 stage straight into the green
+        AI stage) just re-colors the ongoing blink in place, without
+        stopping/restarting the loop — this is what keeps the light
+        continuously blinking across the stage transition instead of
+        pausing solid in between.
 
         Idempotent by design: this gets called from more than one place for
         the same run (the button/command handler AND indexing_worker's own
@@ -1514,10 +1543,11 @@ class RealtimeSmartSearchApp:
         own independent self-rescheduling after() loop — two loops toggling
         the same shared _ramp_blink_on flag in close succession effectively
         cancel each other out, which is why the dot used to look static
-        instead of blinking. Calling this while already blinking is now a
-        no-op."""
+        instead of blinking."""
+        self._ramp_blink_on_color, self._ramp_blink_off_color = \
+            self._RAMP_BLINK_COLORS.get(color, self._RAMP_BLINK_COLORS["yellow"])
         if getattr(self, "_ramp_blinking", False):
-            return
+            return  # already blinking -- color above takes effect on the next tick
         self._ramp_blinking = True
         self._ramp_blink_on = True
         self._ramp_blink_tick()
@@ -1526,7 +1556,9 @@ class RealtimeSmartSearchApp:
         if not getattr(self, "_ramp_blinking", False):
             return
         try:
-            self.status_label.config(fg="#ffcc00" if self._ramp_blink_on else "#6b5200")
+            on_c = getattr(self, "_ramp_blink_on_color", "#ffcc00")
+            off_c = getattr(self, "_ramp_blink_off_color", "#6b5200")
+            self.status_label.config(fg=on_c if self._ramp_blink_on else off_c)
         except Exception:
             pass
         self._ramp_blink_on = not self._ramp_blink_on
@@ -1921,12 +1953,20 @@ class RealtimeSmartSearchApp:
 
             # ── BM25/content indexing stage complete ─────────────────────────
             # files + content_store + content_index are all rebuilt and usable
-            # right now, so stop the Yellow blink and go solid Green — Search
-            # and Advanced become usable immediately even though the AI
-            # embedding pass below can still take a long time. The ramp only
-            # advances to Blue once AI embeddings finish too (see the end of
-            # this function / _ai_fully_indexed()).
-            self.root.after(0, lambda: (self._ramp_blink_stop(final_fg="#4caf50"), self._sync_ai_adv_lock()))
+            # right now, so Search and Advanced become usable immediately even
+            # though the AI embedding pass below can still take a long time.
+            # If an AI embedding pass IS about to run, keep the ramp blinking
+            # but switch it from Yellow to Green so it's visually obvious
+            # which stage is active. If there's no AI pass this run
+            # (selected_models == [] , a deliberate "Tier-only" update), stop
+            # blinking and go solid Green instead. The ramp only advances to
+            # Blue once AI embeddings finish too (see the end of this
+            # function / _ai_fully_indexed()).
+            _will_run_ai_phase = (selected_models is None) or (len(selected_models) > 0)
+            if _will_run_ai_phase:
+                self.root.after(0, lambda: (self._ramp_blink_start(color="green"), self._sync_ai_adv_lock()))
+            else:
+                self.root.after(0, lambda: (self._ramp_blink_stop(final_fg="#4caf50"), self._sync_ai_adv_lock()))
 
             # v1.5: track paths whose content was just re-extracted (new/changed files).
             # Their OLD embeddings (if any, from previous run) are now stale and must
@@ -4601,7 +4641,15 @@ class RealtimeSmartSearchApp:
             state="disabled",
             command=_on_ai_search)
         self._ai_search_btn.pack(side="right", padx=(4, 2), pady=4)
-        add_tooltip(self._ai_search_btn, "AI-powered semantic search (slower, smarter)")
+        def _ai_search_btn_tooltip_text():
+            try:
+                if self._ai_search_btn and self._ai_search_btn.winfo_exists() \
+                        and self._ai_search_btn.cget("text").strip().startswith("↩"):
+                    return "Currently showing AI results — click to switch back to BM25 (faster, keyword-based)"
+            except Exception:
+                pass
+            return "AI-powered semantic search (slower, smarter)"
+        add_tooltip(self._ai_search_btn, _ai_search_btn_tooltip_text)
 
         # ── Advanced button (pagination) ───────────────────────────────────
         # Page 0 = realtime top 100. Each click appends next 500. Last page → reset to page 0.
