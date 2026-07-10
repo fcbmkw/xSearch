@@ -51,6 +51,29 @@ if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)  # when running as exe
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # when running as .py
+
+# v9.4: point the default HuggingFace cache at our own bundled offline cache
+# folder (baked into _internal at build time -- see
+# scripts/download_vi_diacritics_model.py and the .spec file's `datas`
+# entry) instead of the user's regular ~/.cache/huggingface. This is what
+# lets the Vietnamese diacritics-restoration model (and its base model,
+# vinai/bartpho-syllable, which it depends on as a PEFT adapter) load fully
+# offline with no network call, no matter what machine this runs on.
+# Must be set BEFORE transformers/huggingface_hub get imported anywhere
+# (even indirectly), since huggingface_hub reads this once into a
+# module-level constant at import time and ignores later changes.
+# Does NOT affect jina_v3/bge_gemma2: those are loaded from an explicit
+# local folder path (SentenceTransformer(model_path)) and downloaded via
+# snapshot_download(..., local_dir=...), neither of which goes through this
+# default cache location -- so this is safe to set unconditionally.
+# sys._MEIPASS is where PyInstaller's bundled `datas` actually live (the
+# _internal folder, for both onefile and onedir builds); falls back to
+# _BASE_DIR when running as a plain .py, where this folder simply won't
+# exist yet and huggingface_hub will just create it fresh as an empty cache
+# (fine for local dev/testing -- it'll download into it like normal).
+_vi_dia_bundle_base = getattr(sys, "_MEIPASS", _BASE_DIR)
+os.environ.setdefault("HF_HOME", os.path.join(_vi_dia_bundle_base, "vi_diacritics_model", "hub_cache"))
+
 DB_FILE = os.path.join(_BASE_DIR, 'search_data.db')
 # v7.10 FIX: Search History used to be logged straight into DB_FILE
 # (search_data.db) itself. That meant just typing a query -- even with
@@ -254,7 +277,29 @@ SEMANTIC_MODEL_DIRS = {k: _find_model_dir_for(k) for k in SEMANTIC_MODELS}
 
 SEMANTIC_MIN_WORDS = 3      # query needs at least N words to trigger semantic search
 SEMANTIC_TOP_K     = 50     # retrieve top K semantic results
-SEMANTIC_THRESHOLD = 0.25   # minimum cosine similarity threshold
+
+# v9.3: per-model threshold instead of one shared value. jina_v3 and
+# bge_gemma2 are different architectures with different cosine-similarity
+# score distributions -- the same cutoff can behave very differently
+# between them (this is why bge_gemma2 was returning ZERO results for
+# some queries where jina_v3 still returned some: bge_gemma2's best score
+# for that query was likely just under 0.25). If the debug print in
+# _semantic_search shows a model's best score consistently sitting just
+# below its threshold, lower that model's entry here.
+SEMANTIC_THRESHOLD_BY_MODEL = {
+    "jina_v3":    0.25,
+    # v9.3.1: lowered from 0.25 based on real observed data -- a genuinely
+    # relevant result for a Vietnamese-no-diacritics query scored 0.231
+    # with bge_gemma2 and was being filtered out entirely by the old shared
+    # 0.25 threshold (while jina_v3 cleared it fine for the same query).
+    # 0.20 leaves a little headroom below that observed score. If you see
+    # bge_gemma2 results that are clearly NOT relevant sneaking in now,
+    # raise this back up a bit; if good results are still being cut off,
+    # check the [Semantic] debug log for the new best-score numbers and
+    # lower it further.
+    "bge_gemma2": 0.20,
+}
+SEMANTIC_THRESHOLD_DEFAULT = 0.25  # fallback for any model not listed above
 
 # ── Currently active model for AI Search ────────────────────────────────────
 # Changed via UI dropdown (see RealtimeSmartSearchApp._on_ai_model_change)
@@ -264,6 +309,116 @@ _sem_model  = None
 _sem_ready  = False
 _sem_device = "cpu"
 _sem_loaded_key = None   # model key currently loaded in _sem_model (to detect when reload is needed)
+
+# ── Vietnamese diacritics restoration (v9.4) ────────────────────────────────
+# Fixes AI Search returning nothing/wrong results for Vietnamese queries typed
+# without diacritics (e.g. "he thong kiem soat" instead of "hệ thống kiểm
+# soát") -- jina_v3/bge_gemma2 were trained almost entirely on text WITH
+# diacritics, so diacritics-less Vietnamese tokenizes into something close to
+# gibberish for them, regardless of how "smart" the model otherwise is. This
+# restores the diacritics on the QUERY text before it gets embedded.
+#
+# Model: yammdd/vietnamese-error-correction (LoRA adapter over
+# vinai/bartpho-syllable, MIT license, ~0.4B params). Unlike jina_v3/
+# bge_gemma2 (multi-GB, downloaded on demand via the Update DB window), this
+# one is small enough to bake directly into the exe at build time -- see
+# scripts/download_vi_diacritics_model.py (run during the GitHub Actions
+# build, BEFORE pyinstaller) and the `datas` entry in the .spec file. At
+# runtime we only ever load it from that bundled local folder, never
+# download it -- if it's missing, diacritics restoration is just silently
+# skipped (AI Search still works, just without this enhancement), it's not
+# treated as a fatal error.
+_vi_dia_pipe = None
+_vi_dia_ready = False
+_vi_dia_load_attempted = False
+
+VI_DIA_REPO = "yammdd/vietnamese-error-correction"
+
+def _vi_dia_bundle_present():
+    """Whether the offline model cache was actually baked in at build time
+    (see scripts/download_vi_diacritics_model.py + the .spec `datas` entry).
+    HF_HOME already points here (set at the very top of this file) -- this
+    just checks the folder is non-empty before we bother trying to load
+    anything from it."""
+    cache_dir = os.environ.get("HF_HOME", "")
+    return bool(cache_dir) and os.path.isdir(cache_dir) and os.listdir(cache_dir)
+
+def _load_vi_diacritics_model():
+    """Lazily load the bundled Vietnamese diacritics-restoration model.
+    Safe to call repeatedly -- only does real work once. Returns True if the
+    model is ready to use, False if unavailable (missing/failed to load),
+    in which case callers should just skip the restoration step rather than
+    error out -- this is a nice-to-have enhancement, not a hard requirement
+    for AI Search to function.
+
+    Loads by repo ID (not a manual local folder path) with
+    local_files_only=True, resolving entirely against the bundled offline
+    cache that HF_HOME points at (set at the top of this file, before
+    transformers/huggingface_hub ever get imported). This matters because
+    VI_DIA_REPO is a PEFT/LoRA adapter, not a full model -- transformers'
+    automatic PEFT support internally ALSO fetches the base model
+    (vinai/bartpho-syllable) referenced inside the adapter's config, and
+    that nested fetch needs to resolve from the same offline cache too, not
+    just the top-level from_pretrained call."""
+    global _vi_dia_pipe, _vi_dia_ready, _vi_dia_load_attempted
+    if _vi_dia_ready:
+        return True
+    if _vi_dia_load_attempted:
+        return False   # already tried and failed this run -- don't retry every keystroke
+    _vi_dia_load_attempted = True
+    try:
+        if not _vi_dia_bundle_present():
+            print(f"[VI-diacritics] Not bundled (empty/missing cache at "
+                  f"{os.environ.get('HF_HOME')}) — restoration disabled, "
+                  f"AI Search still works normally otherwise.")
+            return False
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+        tok = AutoTokenizer.from_pretrained(VI_DIA_REPO, local_files_only=True)
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(VI_DIA_REPO, local_files_only=True)
+        _vi_dia_pipe = pipeline("text2text-generation", model=mdl, tokenizer=tok)
+        _vi_dia_ready = True
+        print("[VI-diacritics] Model loaded OK (offline, bundled).")
+        return True
+    except Exception as _e:
+        print(f"[VI-diacritics] Load failed ({_e}) — restoration disabled, "
+              f"AI Search still works normally otherwise.")
+        return False
+
+# Matches any character Vietnamese diacritics actually use (tone marks +
+# accented vowels + đ/Đ). If a query already contains any of these, it's
+# either already fully accented or not Vietnamese at all -- either way,
+# running it through the restoration model is more likely to make it worse
+# than better, so we only trigger restoration when NONE of these appear.
+_VI_DIACRITIC_CHARS = re.compile(
+    "[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợ"
+    "ùúủũụưừứửữựỳýỷỹỵđ"
+    "ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ"
+    "ÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]"
+)
+
+def _maybe_restore_diacritics(query):
+    """If `query` looks like it might be Vietnamese typed without diacritics
+    (no diacritic characters at all, but does contain letters), try
+    restoring it via the bundled model. Always returns a usable query --
+    falls back to the original text unchanged on any failure/skip, so this
+    can never make search worse than not calling it at all, only better or
+    neutral."""
+    if not query or not query.strip():
+        return query
+    if _VI_DIACRITIC_CHARS.search(query):
+        return query   # already has diacritics (or isn't Vietnamese) -- leave it alone
+    if not re.search(r"[a-zA-Z]", query):
+        return query   # no letters at all (e.g. pure numbers/symbols) -- nothing to restore
+    if not _load_vi_diacritics_model():
+        return query   # model unavailable -- silent no-op, not an error
+    try:
+        restored = _vi_dia_pipe(query, max_new_tokens=128)[0]["generated_text"]
+        if restored and restored.strip():
+            print(f"[VI-diacritics] '{query}' -> '{restored}'")
+            return restored
+    except Exception as _e:
+        print(f"[VI-diacritics] Restoration failed ({_e}), using original query.")
+    return query
 
 def _find_model_dir(base_dir):
     """Walk up to 4 subdirectory levels to find config.json (HuggingFace model)."""
@@ -2671,13 +2826,18 @@ class RealtimeSmartSearchApp:
                 pass
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _semantic_search(self, query, top_k=SEMANTIC_TOP_K, threshold=SEMANTIC_THRESHOLD):
+    def _semantic_search(self, query, top_k=SEMANTIC_TOP_K, threshold=None):
         """Return list of (path, score_pct) using cosine similarity against the embedding
         table of the currently selected model. The 2 models (jina_v3/bge_gemma2) have
-        different embedding dimensions/vector spaces so each uses a separate table."""
+        different embedding dimensions/vector spaces so each uses a separate table,
+        and (v9.3) each can have its own similarity threshold -- see
+        SEMANTIC_THRESHOLD_BY_MODEL near the top of the file."""
         try:
             if not _load_semantic_model():
                 return []
+            if threshold is None:
+                threshold = SEMANTIC_THRESHOLD_BY_MODEL.get(_sem_model_key, SEMANTIC_THRESHOLD_DEFAULT)
+            query = _maybe_restore_diacritics(query)
             import numpy as np
             q_vec = _encode_query(query, _sem_model_key).astype("float32")
             conn = self.db_conn
@@ -2697,7 +2857,25 @@ class RealtimeSmartSearchApp:
             mat = np.frombuffer(b"".join(r[1] for r in rows), dtype="float32").reshape(len(rows), -1)
             scores = mat @ q_vec   # cosine similarity (vectors normalized)
             top_idx = np.argsort(scores)[::-1][:top_k]
-            return [(paths[i], float(scores[i])) for i in top_idx if scores[i] >= threshold]
+            results = [(paths[i], float(scores[i])) for i in top_idx if scores[i] >= threshold]
+            if not results and len(top_idx) > 0:
+                # v9.3: everything got filtered out by `threshold`. This is
+                # worth logging rather than silently returning [] -- the
+                # single SEMANTIC_THRESHOLD (0.25) is shared by both models,
+                # but jina_v3 and bge_gemma2 are different architectures
+                # with different cosine-similarity score distributions, so
+                # the same cutoff can behave very differently between them
+                # (e.g. one model still clears 0.25 for a bad/ambiguous
+                # query, like non-diacritic Vietnamese, while the other's
+                # best score sits just under it and gets filtered to
+                # nothing). Print the actual best score reached so this is
+                # easy to diagnose instead of just looking "broken".
+                _best = float(scores[top_idx[0]])
+                print(f"[Semantic] {_sem_model_key}: 0 results after threshold filter "
+                      f"(best raw score was {_best:.3f}, threshold is {threshold}). "
+                      f"If this best score is consistently just under the threshold for "
+                      f"this model, consider lowering SEMANTIC_THRESHOLD for it specifically.")
+            return results
         except Exception as _e:
             print(f"[Semantic] Search error: {_e}")
             return []

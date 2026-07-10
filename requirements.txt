@@ -18,6 +18,14 @@ huggingface_hub
 # every BM25 search path fail with "No module named 'rank_bm25'".
 rank_bm25
 
+# Vietnamese diacritics restoration (v9.4) -- yammdd/vietnamese-error-correction
+# is a LoRA adapter (needs peft) on top of vinai/bartpho-syllable (needs
+# sentencepiece for its tokenizer). Baked into _internal at build time via
+# scripts/download_vi_diacritics_model.py + the .spec file's `datas` entry,
+# not downloaded at runtime.
+sentencepiece
+peft
+
 # CPU-only torch build. This is dramatically smaller than the default
 # CUDA-enabled wheel (which bundles multiple GB of CUDA/cuDNN binaries) and
 # is the right choice unless you specifically need GPU inference on the

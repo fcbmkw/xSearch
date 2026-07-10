@@ -67,6 +67,9 @@ _AI_PACKAGES = [
     'huggingface_hub',
     'einops',
     'regex',
+    'rank_bm25',
+    'peft',           # needed for the vi_diacritics LoRA adapter
+    'sentencepiece',  # needed for the vi_diacritics base model's tokenizer
 ]
 
 _datas = []
@@ -81,6 +84,20 @@ for _pkg in _AI_PACKAGES:
         _hiddenimports += _h
     except Exception as _e:
         print(f"[spec] WARNING: collect_all('{_pkg}') failed: {_e}")
+
+# v9.4: bake the pre-downloaded Vietnamese diacritics-restoration model
+# (base model + LoRA adapter, fetched by scripts/download_vi_diacritics_model.py
+# BEFORE this spec runs) into _internal/vi_diacritics_model/hub_cache/.
+# app.py points HF_HOME at this exact folder at startup and loads with
+# local_files_only=True, so this is the ONLY place this model's files come
+# from -- nothing downloaded on the end user's machine.
+if os.path.isdir("vi_diacritics_model"):
+    _datas.append(("vi_diacritics_model", "vi_diacritics_model"))
+else:
+    print("[spec] WARNING: vi_diacritics_model/ not found -- did the "
+          "download_vi_diacritics_model.py build step run before this? "
+          "Building without it: diacritics restoration will be silently "
+          "disabled in this build, everything else still works.")
 
 a = Analysis(
     ['app.py'],
