@@ -62,6 +62,97 @@ DB_FILE = os.path.join(_BASE_DIR, 'search_data.db')
 # merely searching can never make the ramp light think indexing happened.
 HISTORY_DB_FILE = os.path.join(_BASE_DIR, 'search_history.db')
 
+# ── Terminology glossary (v9.6) ─────────────────────────────────────────────
+# Fixes: searching "Switch_Crossing"/"check rail" finds nothing even when a
+# file is literally named/contains "分岐器" (the Japanese term for the same
+# railway part), because neither BM25 (exact keyword match) nor the AI
+# embedding models (never learned this narrow domain-specific term pairing
+# from general training data) can bridge that gap on their own.
+#
+# GLOSSARY_FILE is a plain 2-column Excel file the user maintains themselves
+# (原文=source term / 訳文=translated term), placed next to the exe. Loading
+# it is entirely optional -- if it's missing, both BM25 and AI Search work
+# exactly as before, just without term-equivalence expansion.
+GLOSSARY_FILE = os.path.join(_BASE_DIR, '用語.xlsx')
+
+def _load_glossary():
+    """Build a symmetric term-equivalence table from GLOSSARY_FILE:
+    GLOSSARY[term_lower_or_as_is] -> set of every OTHER term considered
+    equivalent to it (e.g. GLOSSARY["switch"] might contain "分岐器",
+    "switch crossing", "check rail", ... if your xlsx groups them together
+    under the same 訳文). Multiple 原文 rows sharing the same 訳文 all become
+    mutual synonyms of each other too, not just of that one 訳文 value --
+    this is how you group several English variants (Switch_Crossing, switch
+    rail, Switch-model, ...) under one term: give them all the SAME 訳文 in
+    the spreadsheet, one row each.
+    Returns {} (not an error) if the file is missing/unreadable -- this
+    feature is opt-in, its absence should never break search."""
+    if not os.path.isfile(GLOSSARY_FILE):
+        return {}
+    try:
+        import pandas as _pd
+        df = _pd.read_excel(GLOSSARY_FILE, sheet_name=0)
+        cols = list(df.columns)
+        if len(cols) < 2:
+            print(f"[Glossary] {GLOSSARY_FILE}: expected 2 columns (原文/訳文), found {len(cols)} — skipped.")
+            return {}
+        src_col, dst_col = cols[0], cols[1]
+        # Group by 訳文 (translated term) so every 原文 row that shares the
+        # same translation becomes a mutual synonym of the others, not just
+        # of the 訳文 itself.
+        from collections import defaultdict
+        groups = defaultdict(set)   # 訳文 value -> set of all terms (原文 rows + itself)
+        for _, row in df.iterrows():
+            src = row.get(src_col)
+            dst = row.get(dst_col)
+            src = str(src).strip() if src is not None and str(src).strip().lower() != "nan" else ""
+            dst = str(dst).strip() if dst is not None and str(dst).strip().lower() != "nan" else ""
+            if not src or not dst:
+                continue   # blank row -- the real xlsx has several of these
+            groups[dst].add(src)
+            groups[dst].add(dst)
+        glossary = defaultdict(set)
+        for _dst, terms in groups.items():
+            for t in terms:
+                key = t.lower()
+                glossary[key] |= {other for other in terms if other.lower() != key}
+        glossary = {k: v for k, v in glossary.items() if v}
+        print(f"[Glossary] Loaded {len(glossary)} terms from {GLOSSARY_FILE}.")
+        return glossary
+    except Exception as _e:
+        print(f"[Glossary] Failed to load {GLOSSARY_FILE} ({_e}) — term expansion disabled, "
+              f"search still works normally otherwise.")
+        return {}
+
+GLOSSARY = _load_glossary()   # {term_lower: {equivalent_term, ...}}
+
+def _glossary_lookup(term):
+    """Case-insensitive lookup — returns a set (possibly empty) of terms
+    considered equivalent to `term`."""
+    return GLOSSARY.get(term.lower(), set())
+
+_GLOSSARY_TOKEN_SPLIT = re.compile(r"[\s_\-]+")
+
+def _expand_query_with_glossary(query):
+    """Append glossary-equivalent terms to `query` text, for AI Search.
+    Splits on whitespace/underscore/hyphen too (not just whitespace) so a
+    compound token like "Switch_Crossing" or "Switch-model" still matches
+    a single-word glossary entry like "switch" -- BM25's tokenizer already
+    does something similar, this keeps AI Search consistent with it.
+    Safe no-op (returns query unchanged) if GLOSSARY is empty or nothing
+    matches."""
+    if not GLOSSARY or not query or not query.strip():
+        return query
+    tokens = [t for t in _GLOSSARY_TOKEN_SPLIT.split(query) if t]
+    extra = set()
+    for t in tokens:
+        extra |= _glossary_lookup(t)
+    if not extra:
+        return query
+    expanded = query + " " + " ".join(sorted(extra))
+    print(f"[Glossary] '{query}' -> '{expanded}'")
+    return expanded
+
 # v9.0: AI libraries (torch/transformers/sentence-transformers/einops) are
 # now bundled directly into the exe at build time -- no more runtime
 # 'ai_libs' folder, no more sys.path surgery, no more heal-attempt
@@ -2833,6 +2924,7 @@ class RealtimeSmartSearchApp:
             if threshold is None:
                 threshold = SEMANTIC_THRESHOLD_BY_MODEL.get(_sem_model_key, SEMANTIC_THRESHOLD_DEFAULT)
             query = _maybe_restore_diacritics(query)
+            query = _expand_query_with_glossary(query)
             import numpy as np
             q_vec = _encode_query(query, _sem_model_key).astype("float32")
             conn = self.db_conn
@@ -3349,7 +3441,22 @@ class RealtimeSmartSearchApp:
                                   if len(k) >= 3 and k.lower() not in _STOP_WORDS and _is_fts_safe(k)]
                     if not fts_tokens:
                         return None   # no FTS tokens available
-                    fts_terms = " AND ".join(f'"{k}"' for k in fts_tokens)
+                    # v9.6: glossary term expansion. Each token that has a
+                    # match in GLOSSARY (e.g. "switch" <-> "分岐器") becomes
+                    # an OR-group instead of a bare token, so a file
+                    # containing EITHER term satisfies that part of the
+                    # query -- other (non-glossary) tokens are still AND'ed
+                    # in as before, unaffected.
+                    fts_groups = []
+                    for k in fts_tokens:
+                        equivalents = _glossary_lookup(k) if GLOSSARY else set()
+                        equivalents = {e for e in equivalents if _is_fts_safe(e)}
+                        if equivalents:
+                            or_terms = [k] + sorted(equivalents)
+                            fts_groups.append("(" + " OR ".join(f'"{t}"' for t in or_terms) + ")")
+                        else:
+                            fts_groups.append(f'"{k}"')
+                    fts_terms = " AND ".join(fts_groups)
                     try:
                         cursor.execute(
                             "SELECT path FROM content_index WHERE content MATCH ? LIMIT ?",
