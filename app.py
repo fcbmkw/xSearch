@@ -52,28 +52,6 @@ if getattr(sys, 'frozen', False):
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # when running as .py
 
-# v9.4: point the default HuggingFace cache at our own bundled offline cache
-# folder (baked into _internal at build time -- see
-# scripts/download_vi_diacritics_model.py and the .spec file's `datas`
-# entry) instead of the user's regular ~/.cache/huggingface. This is what
-# lets the Vietnamese diacritics-restoration model (and its base model,
-# vinai/bartpho-syllable, which it depends on as a PEFT adapter) load fully
-# offline with no network call, no matter what machine this runs on.
-# Must be set BEFORE transformers/huggingface_hub get imported anywhere
-# (even indirectly), since huggingface_hub reads this once into a
-# module-level constant at import time and ignores later changes.
-# Does NOT affect jina_v3/bge_gemma2: those are loaded from an explicit
-# local folder path (SentenceTransformer(model_path)) and downloaded via
-# snapshot_download(..., local_dir=...), neither of which goes through this
-# default cache location -- so this is safe to set unconditionally.
-# sys._MEIPASS is where PyInstaller's bundled `datas` actually live (the
-# _internal folder, for both onefile and onedir builds); falls back to
-# _BASE_DIR when running as a plain .py, where this folder simply won't
-# exist yet and huggingface_hub will just create it fresh as an empty cache
-# (fine for local dev/testing -- it'll download into it like normal).
-_vi_dia_bundle_base = getattr(sys, "_MEIPASS", _BASE_DIR)
-os.environ.setdefault("HF_HOME", os.path.join(_vi_dia_bundle_base, "vi_diacritics_model", "hub_cache"))
-
 DB_FILE = os.path.join(_BASE_DIR, 'search_data.db')
 # v7.10 FIX: Search History used to be logged straight into DB_FILE
 # (search_data.db) itself. That meant just typing a query -- even with
@@ -319,47 +297,60 @@ _sem_loaded_key = None   # model key currently loaded in _sem_model (to detect w
 # restores the diacritics on the QUERY text before it gets embedded.
 #
 # Model: yammdd/vietnamese-error-correction (LoRA adapter over
-# vinai/bartpho-syllable, MIT license, ~0.4B params). Unlike jina_v3/
-# bge_gemma2 (multi-GB, downloaded on demand via the Update DB window), this
-# one is small enough to bake directly into the exe at build time -- see
-# scripts/download_vi_diacritics_model.py (run during the GitHub Actions
-# build, BEFORE pyinstaller) and the `datas` entry in the .spec file. At
-# runtime we only ever load it from that bundled local folder, never
-# download it -- if it's missing, diacritics restoration is just silently
-# skipped (AI Search still works, just without this enhancement), it's not
+# vinai/bartpho-syllable, MIT license, ~0.4B params). v9.5: like jina_v3/
+# bge_gemma2, this is now downloaded ON DEMAND into models/vi-diacritics/
+# next to the exe (via the "Install online..." button in the Update DB
+# window, using the same safe snapshot_download-into-a-folder mechanism
+# already used for the embedding models), NOT baked into the exe at build
+# time. An earlier version baked it into _internal, but bartpho-syllable's
+# weights alone are ~1.5-2GB (it inherits mBART's huge multilingual
+# vocabulary/embedding table) even after stripping the redundant TF/Flax/
+# ONNX copies, which made the "small download" idea (~500MB) unrealistic to
+# bake in -- moving it to the same on-demand download flow as the other
+# models keeps the base exe small again and treats this as what it really
+# is: an optional download, not core infrastructure.
+#
+# If it's not installed, diacritics restoration is just silently skipped
+# (AI Search still works, just without this enhancement) -- it's not
 # treated as a fatal error.
 _vi_dia_pipe = None
 _vi_dia_ready = False
 _vi_dia_load_attempted = False
 
-VI_DIA_REPO = "yammdd/vietnamese-error-correction"
+VI_DIA_BASE_REPO = "vinai/bartpho-syllable"
+VI_DIA_ADAPTER_REPO = "yammdd/vietnamese-error-correction"
+# Files we never need at runtime regardless of which of the two repos above
+# they came from -- see scripts/download_vi_diacritics_model.py, which
+# applies the same filtering when actually downloading these.
+VI_DIA_IGNORE_PATTERNS = [
+    "*.h5", "tf_model*", "*.msgpack", "flax_model*", "*.onnx", "*.ot",
+    "*.md", "*.png", "*.jpg",
+]
 
-def _vi_dia_bundle_present():
-    """Whether the offline model cache was actually baked in at build time
-    (see scripts/download_vi_diacritics_model.py + the .spec `datas` entry).
-    HF_HOME already points here (set at the very top of this file) -- this
-    just checks the folder is non-empty before we bother trying to load
-    anything from it."""
-    cache_dir = os.environ.get("HF_HOME", "")
-    return bool(cache_dir) and os.path.isdir(cache_dir) and os.listdir(cache_dir)
+def _vi_dia_local_dir():
+    """Local folder these get downloaded into -- same models/ root as
+    jina_v3/bge_gemma2, NOT inside the exe/_internal."""
+    return os.path.join(_MODEL_ROOT_CANDIDATES[0], "vi-diacritics")
+
+def _vi_dia_installed():
+    d = _vi_dia_local_dir()
+    return (os.path.isfile(os.path.join(d, "base", "config.json")) and
+            os.path.isfile(os.path.join(d, "adapter", "adapter_config.json")))
 
 def _load_vi_diacritics_model():
-    """Lazily load the bundled Vietnamese diacritics-restoration model.
-    Safe to call repeatedly -- only does real work once. Returns True if the
-    model is ready to use, False if unavailable (missing/failed to load),
-    in which case callers should just skip the restoration step rather than
-    error out -- this is a nice-to-have enhancement, not a hard requirement
-    for AI Search to function.
+    """Lazily load the Vietnamese diacritics-restoration model from its
+    local models/vi-diacritics/ folder. Safe to call repeatedly -- only
+    does real work once. Returns True if the model is ready to use, False
+    if unavailable (not installed / failed to load), in which case callers
+    should just skip the restoration step rather than error out -- this is
+    a nice-to-have enhancement, not a hard requirement for AI Search to
+    function.
 
-    Loads by repo ID (not a manual local folder path) with
-    local_files_only=True, resolving entirely against the bundled offline
-    cache that HF_HOME points at (set at the top of this file, before
-    transformers/huggingface_hub ever get imported). This matters because
-    VI_DIA_REPO is a PEFT/LoRA adapter, not a full model -- transformers'
-    automatic PEFT support internally ALSO fetches the base model
-    (vinai/bartpho-syllable) referenced inside the adapter's config, and
-    that nested fetch needs to resolve from the same offline cache too, not
-    just the top-level from_pretrained call."""
+    Loaded explicitly via PEFT (base model + LoRA adapter as two separate
+    local folders) rather than relying on transformers' automatic
+    repo-ID-based PEFT resolution -- that auto-resolution only reliably
+    works when loading by repo ID against a proper HF hub cache, not from
+    two arbitrary local folders."""
     global _vi_dia_pipe, _vi_dia_ready, _vi_dia_load_attempted
     if _vi_dia_ready:
         return True
@@ -367,17 +358,21 @@ def _load_vi_diacritics_model():
         return False   # already tried and failed this run -- don't retry every keystroke
     _vi_dia_load_attempted = True
     try:
-        if not _vi_dia_bundle_present():
-            print(f"[VI-diacritics] Not bundled (empty/missing cache at "
-                  f"{os.environ.get('HF_HOME')}) — restoration disabled, "
-                  f"AI Search still works normally otherwise.")
+        if not _vi_dia_installed():
+            print(f"[VI-diacritics] Not installed (see {_vi_dia_local_dir()}) — "
+                  f"restoration disabled. Install it from the Update DB window "
+                  f"if you want this. AI Search still works normally otherwise.")
             return False
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
-        tok = AutoTokenizer.from_pretrained(VI_DIA_REPO, local_files_only=True)
-        mdl = AutoModelForSeq2SeqLM.from_pretrained(VI_DIA_REPO, local_files_only=True)
+        from peft import PeftModel
+        base_dir = os.path.join(_vi_dia_local_dir(), "base")
+        adapter_dir = os.path.join(_vi_dia_local_dir(), "adapter")
+        tok = AutoTokenizer.from_pretrained(adapter_dir)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(base_dir)
+        mdl = PeftModel.from_pretrained(base_model, adapter_dir)
         _vi_dia_pipe = pipeline("text2text-generation", model=mdl, tokenizer=tok)
         _vi_dia_ready = True
-        print("[VI-diacritics] Model loaded OK (offline, bundled).")
+        print("[VI-diacritics] Model loaded OK.")
         return True
     except Exception as _e:
         print(f"[VI-diacritics] Load failed ({_e}) — restoration disabled, "
@@ -5188,6 +5183,94 @@ class RealtimeSmartSearchApp:
 
             threading.Thread(target=_bg, daemon=True).start()
 
+        def _install_vi_diacritics_online(status_lbl, install_btn, dialog):
+            """Download the Vietnamese diacritics-restoration model (base
+            model + LoRA adapter, two separate HF repos) into
+            models/vi-diacritics/{base,adapter}/. Same safe
+            snapshot_download-into-a-folder mechanism as
+            _install_model_online, just for 2 repos instead of 1, and with
+            ignore_patterns to skip redundant TensorFlow/Flax/ONNX weight
+            copies that vinai/bartpho-syllable ships alongside the PyTorch
+            ones we actually use (this is what made an earlier bundled-into-
+            the-exe attempt balloon to several GB for no benefit)."""
+            if not messagebox.askyesno(
+                "Install Vietnamese diacritics restoration — internet required",
+                "Download the Vietnamese diacritics-restoration model now?\n\n"
+                "Improves AI Search when queries are typed without dấu "
+                "(e.g. \"he thong kiem soat\" instead of \"hệ thống kiểm soát\").\n\n"
+                "Requires internet access, ~1-2GB disk space.",
+                parent=dialog):
+                dialog.lift()
+                return
+            local_root = _vi_dia_local_dir()
+            abort_event = threading.Event()
+
+            def _do_abort():
+                abort_event.set()
+                try:
+                    status_lbl.config(text="cancelled", fg="#888888")
+                    install_btn.config(state="normal", text="Install online...",
+                                        command=lambda: _install_vi_diacritics_online(status_lbl, install_btn, dialog))
+                except Exception:
+                    pass
+
+            try:
+                install_btn.config(state="normal", text="Abort", command=_do_abort)
+                status_lbl.config(text="downloading...", fg="#ffcc00")
+            except Exception:
+                pass
+
+            def _bg():
+                try:
+                    from huggingface_hub import snapshot_download
+                except ImportError:
+                    def _fail():
+                        if abort_event.is_set():
+                            return
+                        status_lbl.config(text="huggingface_hub not installed", fg="#ff6666")
+                        install_btn.config(state="normal", text="Install online...",
+                                            command=lambda: _install_vi_diacritics_online(status_lbl, install_btn, dialog))
+                        messagebox.showerror(
+                            "Install model",
+                            "The 'huggingface_hub' package isn't installed.\n"
+                            "Run: pip install huggingface_hub --break-system-packages",
+                            parent=dialog)
+                        dialog.lift()
+                    self.root.after(0, _fail)
+                    return
+                try:
+                    base_dest = os.path.join(local_root, "base")
+                    adapter_dest = os.path.join(local_root, "adapter")
+                    os.makedirs(base_dest, exist_ok=True)
+                    os.makedirs(adapter_dest, exist_ok=True)
+                    snapshot_download(repo_id=VI_DIA_BASE_REPO, local_dir=base_dest,
+                                       ignore_patterns=VI_DIA_IGNORE_PATTERNS)
+                    if abort_event.is_set():
+                        return
+                    snapshot_download(repo_id=VI_DIA_ADAPTER_REPO, local_dir=adapter_dest,
+                                       ignore_patterns=VI_DIA_IGNORE_PATTERNS)
+                    if abort_event.is_set():
+                        return
+                    def _ok():
+                        status_lbl.config(text="✓ installed", fg="#4caf50")
+                        install_btn.config(state="normal", text="Reinstall...",
+                                           command=lambda: _install_vi_diacritics_online(status_lbl, install_btn, dialog))
+                        dialog.lift()
+                    self.root.after(0, _ok)
+                except Exception as e:
+                    if abort_event.is_set():
+                        return
+                    err = str(e)
+                    def _err():
+                        status_lbl.config(text="download failed", fg="#ff6666")
+                        install_btn.config(state="normal", text="Install online...",
+                                            command=lambda: _install_vi_diacritics_online(status_lbl, install_btn, dialog))
+                        messagebox.showerror("Install model", f"Download failed:\n{err}", parent=dialog)
+                        dialog.lift()
+                    self.root.after(0, _err)
+
+            threading.Thread(target=_bg, daemon=True).start()
+
         def _on_update_db():
             """v5.9: clicking Update DB now opens an options dialog instead
             of scanning immediately — pick which file-type tiers to index,
@@ -5295,6 +5378,31 @@ class RealtimeSmartSearchApp:
 
             tk.Label(ai_f, text="Installing requires internet access (downloads from HuggingFace).",
                      bg=BG_COLOR, fg="#888888", font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
+
+            # ── Vietnamese diacritics restoration (optional, separate from
+            # the embedding models above — this is a query-preprocessing
+            # helper, not something you pick for search, so no "build
+            # embeddings" checkbox here, just install status) ─────────────
+            vidia_f = tk.LabelFrame(dlg, text="Vietnamese diacritics restoration (optional)",
+                                     bg=BG_COLOR, fg="#33363c",
+                                     font=("Segoe UI", 9, "bold"), padx=10, pady=8)
+            vidia_f.pack(fill="x", padx=12, pady=(0, 6))
+            vidia_row = tk.Frame(vidia_f, bg=BG_COLOR)
+            vidia_row.pack(fill="x", pady=3)
+            tk.Label(vidia_row, text="Improves AI Search for queries typed without dấu",
+                     bg=BG_COLOR, font=("Segoe UI", 9)).pack(side="left")
+            vidia_installed = _vi_dia_installed()
+            vidia_status_lbl = tk.Label(
+                vidia_row, text=("✓ installed" if vidia_installed else "not installed"),
+                bg=BG_COLOR, fg=("#4caf50" if vidia_installed else "#888888"),
+                font=("Segoe UI", 9))
+            vidia_status_lbl.pack(side="left", padx=(8, 0))
+            vidia_install_btn = tk.Button(
+                vidia_row, text=("Reinstall..." if vidia_installed else "Install online..."),
+                font=("Segoe UI", 8), cursor="hand2", state="normal")
+            vidia_install_btn.config(
+                command=lambda: _install_vi_diacritics_online(vidia_status_lbl, vidia_install_btn, dlg))
+            vidia_install_btn.pack(side="right")
 
             # ── Action buttons ───────────────────────────────────────────────
             btn_row = tk.Frame(dlg, bg=BG_COLOR)
