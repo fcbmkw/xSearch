@@ -23,6 +23,12 @@ rank_bm25
 # sentencepiece for its tokenizer). Baked into _internal at build time via
 # scripts/download_vi_diacritics_model.py + the .spec file's `datas` entry,
 # not downloaded at runtime.
+# OCR for images (.jpg/.png/...) — optional, off by default (Update DB
+# "OCR images" checkbox). EasyOCR chosen over Tesseract because it needs
+# no separate native binary installer, and has solid built-in support for
+# Japanese + Vietnamese + English together.
+easyocr
+
 sentencepiece
 peft
 

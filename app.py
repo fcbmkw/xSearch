@@ -588,6 +588,64 @@ def is_text_file(filepath):
         return True
     except: return False
 
+# ── OCR (v9.13) ──────────────────────────────────────────────────────────
+# Optional, off by default (see the "OCR images" checkbox in Update DB).
+# Images have no literal embedded text -- unlike .txt/.py (plain read) or
+# .docx/.pdf (format-specific parser), a screenshot/scan needs an actual
+# computer-vision model to "read" the pixels. EasyOCR is used here (not
+# Tesseract) because it needs no separate native binary installed
+# alongside Python -- just a pip package -- and has solid out-of-the-box
+# support for Japanese + Vietnamese + English together, matching this
+# app's document mix. It downloads its own model weights (~a few hundred
+# MB per language) on first use.
+_OCR_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif'}
+OCR_ENABLED = False   # set from the Update DB dialog's "OCR images" checkbox
+_ocr_readers = {}          # {'ja_en': Reader, 'vi_en': Reader} once loaded
+_ocr_load_attempted = False
+
+def _load_ocr_readers():
+    """Lazily load both EasyOCR readers. Safe to call repeatedly -- only
+    does real work once. Returns True if at least one reader loaded OK."""
+    global _ocr_load_attempted
+    if _ocr_readers:
+        return True
+    if _ocr_load_attempted:
+        return False
+    _ocr_load_attempted = True
+    try:
+        import easyocr
+        print("[OCR] Loading EasyOCR readers (first run downloads model weights)...")
+        _ocr_readers['ja_en'] = easyocr.Reader(['ja', 'en'], gpu=False)
+        _ocr_readers['vi_en'] = easyocr.Reader(['vi', 'en'], gpu=False)
+        print("[OCR] EasyOCR readers loaded OK.")
+        return True
+    except Exception as _e:
+        print(f"[OCR] Failed to load EasyOCR ({_e}) — OCR disabled for this run, "
+              f"indexing continues normally for everything else.")
+        return False
+
+def _run_ocr(filepath):
+    """Try both JA/EN and VI/EN readers on `filepath`, keep whichever gives
+    the higher average confidence — lets one code path handle screenshots
+    in either language without knowing ahead of time which one a given
+    image is in. Returns "" (not an error) on any failure — a bad/corrupt
+    image should never stop the rest of indexing."""
+    if not _load_ocr_readers():
+        return ""
+    best_text, best_conf = "", -1.0
+    for reader in _ocr_readers.values():
+        try:
+            results = reader.readtext(filepath, detail=1)
+            if not results:
+                continue
+            avg_conf = sum(r[2] for r in results) / len(results)
+            if avg_conf > best_conf:
+                best_conf = avg_conf
+                best_text = " ".join(r[1] for r in results)
+        except Exception as _e:
+            print(f"[OCR] reader failed on {filepath}: {_e}")
+    return best_text
+
 def get_file_icon(filepath, is_folder=False):
     if is_folder: return "📁 "
     if not filepath: return "📎 "
@@ -1106,6 +1164,8 @@ class RealtimeSmartSearchApp:
         self._adv_search_btn = None      # reference to Advanced button
         self._update_db_btn  = None      # reference to Update DB button (result window only)
         self._update_db_running = False  # True while indexing_worker() is running (button or --update data)
+        self._last_index_status_text = None  # v9.11: last real progress text (e.g. "AI 2/2: 28%"),
+                                              # survives the button widget being recreated on minimize/reopen
         self._mft_file_res   = []        # v2.3: live MFT scan results (files)
         self._mft_folder_res = []        # v2.3: live MFT scan results (folders)
         self._mft_render_pending_f   = False  # v2.4: coalesced re-render flag (File Name tab)
@@ -1191,6 +1251,17 @@ class RealtimeSmartSearchApp:
                 return "Data Updated (AI pending)"
             return "Need Update DB"
         add_tooltip(self.status_label, _ramp_tooltip_text)
+
+        # "+" button -- manually add individual files to the index, without
+        # needing a full Update DB rescan. Useful for one-off files outside
+        # the normal scanned folders, or files you want searchable right
+        # away instead of waiting for the next scheduled Update DB run.
+        self.add_file_btn = tk.Button(self.bg_f, text="+", font=("Segoe UI", 11, "bold"),
+                                       bg=BG_COLOR, fg="#7ec8e3", bd=0,
+                                       activebackground=BG_COLOR, cursor="hand2",
+                                       command=lambda: self._add_files_dialog())
+        self.add_file_btn.pack(side="right", padx=(0, 4), pady=5)
+        add_tooltip(self.add_file_btn, "Add file(s) to the index manually")
 
         # "✕" close button -- only shown once results are being displayed (there's
         # nothing to close in idle mode). Re-packed with before=r_p each time it's
@@ -1490,6 +1561,86 @@ class RealtimeSmartSearchApp:
         self._sync_ai_adv_lock()
         self.root.after(1000, self._ramp_watchdog_tick)
     
+    def _add_files_dialog(self):
+        """'+' button handler — pick one or more files and add them to the
+        index right away, without a full Update DB rescan."""
+        paths = filedialog.askopenfilenames(title="Add files to index")
+        if not paths:
+            return
+        try:
+            self.add_file_btn.config(state="disabled", fg="#888888")
+        except Exception:
+            pass
+        threading.Thread(target=self._add_files_worker, args=(list(paths),), daemon=True).start()
+
+    def _add_files_worker(self, paths):
+        """Runs off the UI thread. Inserts each file into files/
+        content_store/content_index (same tables Update DB uses), and —
+        best-effort only — also embeds it into any AI model table that
+        already has data, so it shows up in AI Search immediately too,
+        not just BM25/File Name. If a model was never built (table empty/
+        missing), we skip AI embedding for it here rather than force a
+        model load just for one file; it'll get picked up on the next full
+        Update DB run for that model like any other file."""
+        added, failed = 0, []
+        try:
+            conn = sqlite3.connect(DB_FILE, timeout=10)
+            c = conn.cursor()
+            active_sem_tables = []
+            for mk, info in SEMANTIC_MODELS.items():
+                try:
+                    c.execute(f"SELECT COUNT(*) FROM {info['table']}")
+                    if c.fetchone()[0] > 0:
+                        active_sem_tables.append((mk, info["table"]))
+                except Exception:
+                    pass   # that model's table doesn't exist yet -- never built, skip
+            for p in paths:
+                try:
+                    if not os.path.isfile(p):
+                        failed.append(p); continue
+                    size = os.path.getsize(p)
+                    name = os.path.basename(p)
+                    mtime = os.path.getmtime(p)
+                    c.execute("INSERT OR REPLACE INTO files (type, name, path, size) VALUES (?,?,?,?)",
+                              ("File", name, p, size))
+                    content = self.get_file_content(p) or ""
+                    c.execute("INSERT OR REPLACE INTO content_store (path, content, mtime) VALUES (?,?,?)",
+                              (p, content, mtime))
+                    c.execute("DELETE FROM content_index WHERE path=?", (p,))
+                    if content:
+                        c.execute("INSERT INTO content_index (path, content) VALUES (?,?)", (p, content))
+                    conn.commit()
+                    # Best-effort AI embedding into already-built models —
+                    # same "filename + content" text the bulk embedder uses.
+                    embed_text = (name + " " + content[:300]).replace("\n", " ")
+                    for mk, table in active_sem_tables:
+                        try:
+                            if _load_semantic_model(mk):
+                                vec = _encode_passages([embed_text], mk, batch_size=1)[0]
+                                c.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,?)",
+                                          (p, embed_text, vec.astype("float32").tobytes()))
+                                conn.commit()
+                        except Exception as _e:
+                            print(f"[Add file] embed failed for {mk} on {p}: {_e}")
+                    added += 1
+                except Exception as _e:
+                    print(f"[Add file] failed for {p}: {_e}")
+                    failed.append(p)
+            conn.close()
+        except Exception as _e:
+            print(f"[Add file] DB error: {_e}")
+
+        def _done():
+            try:
+                self.add_file_btn.config(state="normal", fg="#7ec8e3")
+            except Exception:
+                pass
+            msg = f"Added {added} file(s) to the index."
+            if failed:
+                msg += f"\n{len(failed)} failed (see console log for details)."
+            messagebox.showinfo("Add files", msg)
+        self.root.after(0, _done)
+
     def get_file_content(self, filepath):
         if not filepath: return ""
         ext = os.path.splitext(filepath)[1].lower()
@@ -1569,6 +1720,9 @@ class RealtimeSmartSearchApp:
                     text = " ".join(parts)
                 except:
                     pass
+            elif ext in _OCR_IMAGE_EXTS:
+                if OCR_ENABLED:
+                    text = _run_ocr(filepath)
             elif ext == '.msg':
                 try:
                     import win32com.client
@@ -1791,7 +1945,17 @@ class RealtimeSmartSearchApp:
         (grey/red/yellow/green) — it never swaps to the progress text (that
         would duplicate what the Update DB button/tooltip already say and
         made the dot visually jump between a dot and a sentence). The
-        Update DB button, on the other hand, does show the live text."""
+        Update DB button, on the other hand, does show the live text.
+
+        v9.11 fix: also remember `text` in self._last_index_status_text.
+        The search box (and its Update DB button) gets torn down and
+        recreated when minimized/reopened — without remembering the last
+        real progress string here, the freshly-recreated button had no way
+        to know we were mid-run at "AI 2/2: 28%" and fell back to a bare
+        "Updating..." with no percentage, discarding progress info that
+        was still perfectly valid, just not visible anymore."""
+        if not done and not error:
+            self._last_index_status_text = text
         try:
             self.status_label.config(text="●", fg=fg)
         except Exception:
@@ -1799,6 +1963,7 @@ class RealtimeSmartSearchApp:
         self._sync_ai_adv_lock()
         if done or error:
             self._update_db_running = False
+            self._last_index_status_text = None
         try:
             btn = self._update_db_btn
             if btn and btn.winfo_exists():
@@ -1811,7 +1976,7 @@ class RealtimeSmartSearchApp:
         except Exception:
             pass
 
-    def indexing_worker(self, selected_tiers=None, selected_models=None):
+    def indexing_worker(self, selected_tiers=None, selected_models=None, ocr_enabled=False):
         """selected_tiers: None = all tiers (1-4, default/backward-compatible).
         Otherwise a set of 0-indexed tier numbers (0=Tier1 ... 3=Tier4) — only
         files in these tiers get their CONTENT extracted/embedded. Filename
@@ -1824,7 +1989,15 @@ class RealtimeSmartSearchApp:
         only, AI stage entirely skipped). Otherwise a list/set of model_key
         strings — only these get embeddings built this run, skipping the
         others entirely (saves a lot of time if the user only cares about
-        one model, e.g. just Jina-v3)."""
+        one model, e.g. just Jina-v3).
+        ocr_enabled: (v9.13) False by default — when True, image files
+        (.jpg/.png/...) also get their content extracted via OCR
+        (EasyOCR), same as Office/PDF/text files. Off by default because
+        OCR is noticeably slower than the other extraction methods and
+        downloads its own model weights on first use — an explicit opt-in
+        via the Update DB dialog's "OCR images" checkbox."""
+        global OCR_ENABLED
+        OCR_ENABLED = bool(ocr_enabled)
         try:
             self._update_db_running = True
             self.root.after(0, lambda: self._begin_update_ramp("Updating..."))
@@ -2007,6 +2180,17 @@ class RealtimeSmartSearchApp:
                                 elif f_basename.lower().startswith(_ENV_FILE_PREFIX):
                                     if f_size < 2 * 1024 * 1024:
                                         is_allowed = True
+                                # Priority 4 (v9.13): images, only when OCR is
+                                # enabled for this run (Update DB "OCR images"
+                                # checkbox) — off by default since OCR is much
+                                # slower than the other extraction methods.
+                                # Capped at 15MB: legitimate screenshots/scans
+                                # are almost always well under this; anything
+                                # bigger is more likely a huge raw photo/scan
+                                # where OCR would be slow for little benefit.
+                                elif f_ext in _OCR_IMAGE_EXTS and OCR_ENABLED:
+                                    if f_size < 15 * 1024 * 1024:
+                                        is_allowed = True
                                 # v2.5: removed the old "unknown extension -> open file
                                 # and sniff for text" fallback. It was extracting a lot
                                 # of installer/SDK metadata (.catnls, .clsid, .iid,
@@ -2048,7 +2232,16 @@ class RealtimeSmartSearchApp:
                                     # genuinely new/changed files get queued again.
                                     _tier = 2 if (f_ext == '' and f_basename.lower().startswith(_ENV_FILE_PREFIX)) \
                                             else self._ext_tier(f_ext)
-                                    if selected_tiers is not None and _tier not in selected_tiers:
+                                    # v9.13: images don't belong to any of the
+                                    # 4 Tiers (they'd fall through to an
+                                    # "unlisted" tier index that no Tier
+                                    # checkbox can ever select), so gate them
+                                    # ONLY by the OCR_ENABLED checkbox
+                                    # (already checked above via is_allowed),
+                                    # not by Tier selection at all.
+                                    if f_ext in _OCR_IMAGE_EXTS:
+                                        pass
+                                    elif selected_tiers is not None and _tier not in selected_tiers:
                                         continue  # tier not requested — skip content extraction
                                     _pending_extract.append((_tier, full_p, _cur_mtime))
                             if len(batch_files) >= 2000:
@@ -2196,8 +2389,22 @@ class RealtimeSmartSearchApp:
                     total_done = skipped_count
 
                     for i in range(0, len(remaining_paths), SEM_BATCH):
-                        paths          = remaining_paths[i:i+SEM_BATCH]
-                        clean_snippets = [(rows_by_path[p] or "").replace("\n", " ") for p in paths]
+                        paths = remaining_paths[i:i+SEM_BATCH]
+                        # v9.8 fix: prepend the filename to the text that gets
+                        # embedded, not just the extracted file content. Before
+                        # this, a file like "Switch-model.zip" — a format we
+                        # never extract text from (.zip is in _BINARY_EXTS) —
+                        # got embedded from an EMPTY content string, producing
+                        # a near-meaningless vector totally disconnected from
+                        # its obviously-relevant filename. Even for text-bearing
+                        # formats (.spck, etc.) whose content is mostly numeric/
+                        # config data rather than natural language, the filename
+                        # is often the single strongest topical signal available
+                        # and was previously being thrown away entirely.
+                        clean_snippets = [
+                            (os.path.basename(p) + " " + (rows_by_path[p] or "")).replace("\n", " ")
+                            for p in paths
+                        ]
                         vecs = _encode_passages(clean_snippets, model_key, batch_size=SEM_BATCH)
                         for path, snippet, vec in zip(paths, clean_snippets, vecs):
                             sem_buf.append((path, snippet, vec.astype("float32").tobytes()))
@@ -3609,7 +3816,21 @@ class RealtimeSmartSearchApp:
                 # for the SAME query in the background -- that used to always
                 # silently kick the view back to BM25 and reset the AI Search
                 # button, even though the user never asked to leave AI mode.
-                if not (self._ai_mode_active and q == getattr(self, "_ai_active_query", None)):
+                # v9.12 fix: once AI Search has been turned on, keep it
+                # "sticky" across new keywords instead of silently falling
+                # back to BM25 and making the user re-click "AI Search"
+                # every time — the semantic model is already loaded/cached
+                # in memory (_load_semantic_model() is a no-op if the right
+                # model is already loaded), so re-running AI search for a
+                # NEW query here is cheap, not a full reload.
+                # _ai_search_and_update() TOGGLES: calling it while
+                # _ai_mode_active is already True restores BM25 instead of
+                # refreshing, so clear the flag first here to make it
+                # re-engage for the new query instead of turning itself off.
+                if self._ai_mode_active and q != getattr(self, "_ai_active_query", None):
+                    self._ai_mode_active = False
+                    threading.Thread(target=self._ai_search_and_update, args=(q,), daemon=True).start()
+                elif not (self._ai_mode_active and q == getattr(self, "_ai_active_query", None)):
                     self._ai_mode_active = False
                 self._adv_mode_active = adv_mode
                 # Update Advanced button label to reflect current mode
@@ -3894,22 +4115,46 @@ class RealtimeSmartSearchApp:
                 return i
         return len(cls._ALL_TIERS)  # unlisted extension -> put at the very end
 
+    # v9.10: tier only breaks ties WITHIN a band of this many
+    # originally-adjacent (by relevance) results, instead of being an
+    # absolute override of relevance order across the whole result set.
+    # Tune this if results still feel too format-biased (raise it) or too
+    # relevance-only / not enough office-doc preference (lower it).
+    _TIER_SORT_BAND_SIZE = 8
+
     def _sort_priority(self, rows, mode):
-        """Sort theo tier (xem _ext_tier ở trên).
-           Within the same tier, non-C: drives are prioritized over C:.
-           Outermost key: match group — rows tagged as an OR-fallback match
-           (row[5] == 1, used by MFT multi-keyword search) always sort BELOW
-           rows that matched the full AND query (row[5] == 0 or untagged).
+        """Sort theo tier (xem _ext_tier ở trên) — used as a gentle
+           tie-breaker among near-equally-relevant results, NOT an absolute
+           override of the relevance order `rows` already arrived in.
+
+           v9.10 fix: the old version sorted PURELY by (grp, tier,
+           drive_score), throwing away the incoming relevance order
+           entirely except as a same-tier tie-breaker. That meant ANY
+           .pdf/.docx (tier 0) always sorted above EVERY other file format,
+           regardless of how relevant it actually was — a barely-relevant
+           PDF could rank above a highly relevant .zip/.spck simply because
+           archives/simulation files aren't in the tier list (fall through
+           to the lowest tier). Now the incoming rank is banded into groups
+           of _TIER_SORT_BAND_SIZE and used as the PRIMARY key -- tier can
+           only reorder results that were already close in relevance, never
+           flip a real relevance gap.
+
+           Outermost key unchanged: match group — rows tagged as an
+           OR-fallback match (row[5] == 1, used by MFT multi-keyword
+           search) always sort BELOW rows that matched the full AND query
+           (row[5] == 0 or untagged).
         """
-        def _key(r):
+        def _key(indexed_row):
+            i, r = indexed_row
             path = r[0] if mode == 0 else r[2]
             drive = path[0].upper() if path and len(path) >= 2 and path[1] == ':' else ''
             drive_score = 99 if drive == 'C' else 0
             ext = os.path.splitext(path)[1].lower()
             tier = self._ext_tier(ext)
             grp = r[5] if len(r) > 5 else 0
-            return (grp, tier, drive_score)
-        return sorted(rows, key=_key)
+            band = i // self._TIER_SORT_BAND_SIZE
+            return (grp, band, tier, drive_score, i)
+        return [r for _, r in sorted(enumerate(rows), key=_key)]
 
     # ── Sortable columns (class methods — shared across ALL trees in ALL panes) ──
     def _sort_tree(self, tree, col, reverse):
@@ -5075,7 +5320,7 @@ class RealtimeSmartSearchApp:
         # the full "--update data tier 1,2" command and pressing Enter.
         # If the box is empty or holds an ordinary search query, behaves
         # exactly as before (full Tier 1-4 scan).
-        def _run_update_db(selected_tiers, selected_models=None):
+        def _run_update_db(selected_tiers, selected_models=None, ocr_enabled=False):
             """Actually kick off the indexing_worker thread. Extracted out of
             the old _on_update_db so both the new dialog's 'Start Update'
             button and (if ever needed again) any other caller can trigger a
@@ -5093,7 +5338,8 @@ class RealtimeSmartSearchApp:
             self._set_index_status(f"Updating (tier {tier_desc})...", "#ffcc00")
             self._ramp_blink_start()
             self.entry_var.set("")
-            threading.Thread(target=self.indexing_worker, args=(selected_tiers, selected_models), daemon=True).start()
+            threading.Thread(target=self.indexing_worker,
+                              args=(selected_tiers, selected_models, ocr_enabled), daemon=True).start()
 
         if not hasattr(self, "_model_abort_events"):
             self._model_abort_events = {}  # model_key -> threading.Event(), set on Abort click
@@ -5336,6 +5582,17 @@ class RealtimeSmartSearchApp:
                                      wraplength=460)
                 cb.pack(fill="x", anchor="w", pady=2)
 
+            # v9.13: OCR images checkbox — off by default. Separate from the
+            # Tier checkboxes above (images don't belong to any of the 4
+            # Tiers), but placed in the same frame since it's conceptually
+            # the same kind of choice: "what content gets extracted".
+            ocr_var = tk.BooleanVar(value=False)
+            ocr_cb = tk.Checkbutton(
+                tiers_f, text="OCR images (.jpg/.png/...) — slower, downloads OCR model on first use",
+                variable=ocr_var, bg=BG_COLOR, anchor="w",
+                font=("Segoe UI", 9), justify="left", wraplength=460)
+            ocr_cb.pack(fill="x", anchor="w", pady=(6, 2))
+
             # ── AI Search models section (separate frame, same dialog) ─────
             # v5.9b: each model now has its own "build embeddings this run"
             # checkbox (checked by default = same as before/all models) --
@@ -5445,7 +5702,7 @@ class RealtimeSmartSearchApp:
                 else:
                     selected_models = None if len(chosen_models) == len(model_var_list) else chosen_models
                 dlg.destroy()
-                _run_update_db(selected_tiers, selected_models)
+                _run_update_db(selected_tiers, selected_models, ocr_var.get())
 
             tk.Button(btn_row, text="Start Update", font=("Segoe UI", 9, "bold"),
                       bg="#2196f3", fg="white", activebackground="#1976d2",
@@ -5469,8 +5726,17 @@ class RealtimeSmartSearchApp:
             cy = max(0, min(cy, sh - dh))
             dlg.geometry(f"+{cx}+{cy}")
 
+        _btn_text = "Update DB"
+        if self._update_db_running:
+            # v9.11 fix: prefer the last real progress string (e.g. "AI 2/2:
+            # 28%") over a bare "Updating..." — this button gets recreated
+            # from scratch whenever the search box is minimized/reopened
+            # mid-run, and previously always lost the percentage at that
+            # point even though indexing was still happily running in the
+            # background the whole time.
+            _btn_text = self._last_index_status_text or "Updating..."
         self._update_db_btn = tk.Button(
-            search_bar, text=("Updating..." if self._update_db_running else "Update DB"),
+            search_bar, text=_btn_text,
             font=("Segoe UI", 8, "bold"),
             bg="#e6e8ec", fg="#33363c",
             relief="raised", bd=2,

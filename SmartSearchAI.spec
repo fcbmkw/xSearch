@@ -70,6 +70,7 @@ _AI_PACKAGES = [
     'rank_bm25',
     'peft',           # needed for the vi_diacritics LoRA adapter
     'sentencepiece',  # needed for the vi_diacritics base model's tokenizer
+    'easyocr',        # optional OCR feature (Update DB "OCR images" checkbox)
 ]
 
 _datas = []
