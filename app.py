@@ -333,9 +333,34 @@ def _vi_dia_local_dir():
     return os.path.join(_MODEL_ROOT_CANDIDATES[0], "vi-diacritics")
 
 def _vi_dia_installed():
+    """v9.13.1 fix: search recursively for the marker files instead of a
+    single hardcoded path. Different huggingface_hub versions lay out
+    local_dir downloads differently (flat vs. nested inside a hashed
+    snapshot subfolder) — a hardcoded exact path made this report "not
+    installed" even right after a successful install, depending on which
+    huggingface_hub version happened to get installed in the build."""
     d = _vi_dia_local_dir()
-    return (os.path.isfile(os.path.join(d, "base", "config.json")) and
-            os.path.isfile(os.path.join(d, "adapter", "adapter_config.json")))
+    def _has_file_named(root, filename):
+        if not os.path.isdir(root):
+            return False
+        for r, _, files in os.walk(root):
+            if filename in files:
+                return True
+        return False
+    return (_has_file_named(os.path.join(d, "base"), "config.json") and
+            _has_file_named(os.path.join(d, "adapter"), "adapter_config.json"))
+
+def _vi_dia_resolve_dir(root, marker_filename):
+    """Return the folder that actually CONTAINS marker_filename under root
+    (searching recursively — see _vi_dia_installed for why), or `root`
+    itself if not found (from_pretrained will then raise its own clear
+    error rather than us silently guessing wrong)."""
+    if os.path.isfile(os.path.join(root, marker_filename)):
+        return root
+    for r, _, files in os.walk(root):
+        if marker_filename in files:
+            return r
+    return root
 
 def _load_vi_diacritics_model():
     """Lazily load the Vietnamese diacritics-restoration model from its
@@ -365,8 +390,8 @@ def _load_vi_diacritics_model():
             return False
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
         from peft import PeftModel
-        base_dir = os.path.join(_vi_dia_local_dir(), "base")
-        adapter_dir = os.path.join(_vi_dia_local_dir(), "adapter")
+        base_dir = _vi_dia_resolve_dir(os.path.join(_vi_dia_local_dir(), "base"), "config.json")
+        adapter_dir = _vi_dia_resolve_dir(os.path.join(_vi_dia_local_dir(), "adapter"), "adapter_config.json")
         tok = AutoTokenizer.from_pretrained(adapter_dir)
         base_model = AutoModelForSeq2SeqLM.from_pretrained(base_dir)
         mdl = PeftModel.from_pretrained(base_model, adapter_dir)
@@ -1260,7 +1285,7 @@ class RealtimeSmartSearchApp:
                                        bg=BG_COLOR, fg="#7ec8e3", bd=0,
                                        activebackground=BG_COLOR, cursor="hand2",
                                        command=lambda: self._add_files_dialog())
-        self.add_file_btn.pack(side="right", padx=(0, 4), pady=5)
+        self.add_file_btn.pack(side="right", padx=(0, 4), pady=5, before=r_p)
         add_tooltip(self.add_file_btn, "Add file(s) to the index manually")
 
         # "✕" close button -- only shown once results are being displayed (there's
@@ -1584,7 +1609,9 @@ class RealtimeSmartSearchApp:
         Update DB run for that model like any other file."""
         added, failed = 0, []
         try:
-            conn = sqlite3.connect(DB_FILE, timeout=10)
+            conn = self.db_conn
+            if conn is None:
+                raise RuntimeError("Database connection not ready (indexing in progress?)")
             c = conn.cursor()
             active_sem_tables = []
             for mk, info in SEMANTIC_MODELS.items():
@@ -1626,7 +1653,9 @@ class RealtimeSmartSearchApp:
                 except Exception as _e:
                     print(f"[Add file] failed for {p}: {_e}")
                     failed.append(p)
-            conn.close()
+            # NOTE: do NOT close conn here — it's self.db_conn, the shared
+            # persistent connection _smart_search_realtime() reads from on
+            # every keystroke, not a connection we opened ourselves.
         except Exception as _e:
             print(f"[Add file] DB error: {_e}")
 
