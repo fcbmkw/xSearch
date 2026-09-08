@@ -1,0 +1,20 @@
+# Personal/generated data -- unique to each user's machine, never share
+search_data.db
+search_history.db
+search_outlook.db
+search_onenote.db
+configure.ini
+
+# AI model weights -- downloaded on demand via "Install online..." in the
+# Update DB dialog; too large for git and covered by their own licenses
+models/
+
+# PyInstaller build output
+build/
+dist/
+
+# Python environment / cache
+venv/
+.venv/
+__pycache__/
+*.pyc
