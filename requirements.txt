@@ -18,11 +18,9 @@ huggingface_hub
 # every BM25 search path fail with "No module named 'rank_bm25'".
 rank_bm25
 
-# Vietnamese diacritics restoration (v9.4) -- yammdd/vietnamese-error-correction
-# is a LoRA adapter (needs peft) on top of vinai/bartpho-syllable (needs
-# sentencepiece for its tokenizer). Baked into _internal at build time via
-# scripts/download_vi_diacritics_model.py + the .spec file's `datas` entry,
-# not downloaded at runtime.
+# Vietnamese diacritics restoration (v9.13.4) -- yammdd/vietnamese-error-correction
+# is a self-contained model, not a bare PEFT adapter as first assumed --
+# only needs sentencepiece (for its tokenizer), NOT peft.
 # OCR for images (.jpg/.png/...) — optional, off by default (Update DB
 # "OCR images" checkbox). EasyOCR chosen over Tesseract because it needs
 # no separate native binary installer, and has solid built-in support for
@@ -30,7 +28,6 @@ rank_bm25
 easyocr
 
 sentencepiece
-peft
 
 # CPU-only torch build. This is dramatically smaller than the default
 # CUDA-enabled wheel (which bundles multiple GB of CUDA/cuDNN binaries) and
@@ -39,8 +36,26 @@ peft
 # line below and pin a matching torch version + CUDA toolkit instead --
 # talk to Claude about this before changing it, since it affects the whole
 # build pipeline size and the .spec file's collected binaries.
+#
+# torchvision MUST be installed alongside torch here (both from the same
+# --extra-index-url so pip resolves mutually compatible versions together).
+# Without it, easyocr/transformers fail at runtime with:
+#   "operator torchvision::nms does not exist"
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
+torchvision
+
+# AI Chat (online, "🌐 Internet"/"🤖 AI Search offline" answer generation) --
+# separate from the offline embedding stack above. Gemini uses Google's own
+# SDK; Groq is called through the standard OpenAI-compatible client (Groq
+# itself doesn't need a dedicated SDK for this app).
+google-genai
+openai
+
+# Drag & drop files into the AI Chat panel (Windows only). Optional -- the
+# app runs fine without it, just prints a warning and disables drag&drop
+# if this isn't installed.
+tkinterdnd2
 
 # --- everything below this line is unrelated to the AI/semantic search
 # feature and was already required by the rest of the app (document
@@ -59,3 +74,8 @@ python-docx
 pypdf
 python-pptx
 xlrd
+
+# --- build-only tools, needed to produce the .exe from SmartSearchAI.spec
+# (NOT needed just to run app.py directly as a script).
+pyinstaller
+pyinstaller-hooks-contrib

@@ -60,6 +60,14 @@ _stdlib_hidden_imports = _collect_all_stdlib_modules()
 # config file that should have been bundled.
 _AI_PACKAGES = [
     'torch',
+    'torchvision',    # v10.18 FIX: was missing here -- caused "operator
+                      # torchvision::nms does not exist" at runtime, because
+                      # PyInstaller's default static analysis doesn't reliably
+                      # catch torchvision's compiled C++ extension (_C.pyd)
+                      # that registers its custom ops. Without collect_all()
+                      # explicitly pulling in that binary, easyocr's import of
+                      # torchvision (and transformers' internal check for it)
+                      # loads a torchvision that's missing its own native ops.
     'transformers',
     'sentence_transformers',
     'tokenizers',
@@ -68,8 +76,7 @@ _AI_PACKAGES = [
     'einops',
     'regex',
     'rank_bm25',
-    'peft',           # needed for the vi_diacritics LoRA adapter
-    'sentencepiece',  # needed for the vi_diacritics base model's tokenizer
+    'sentencepiece',  # needed for the vi-diacritics model's tokenizer
     'easyocr',        # optional OCR feature (Update DB "OCR images" checkbox)
 ]
 
