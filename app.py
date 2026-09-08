@@ -1,20 +1,41 @@
 import sys
 import os
 import types as _types
+import io as _io
 
-# v9.2: required BEFORE anything else once the .spec is built with
+# v9.2/v10.17: required BEFORE anything else once the .spec is built with
 # console=False (windowed mode, no visible console window). In that mode
 # PyInstaller sets sys.stdout/sys.stderr to None (there is no console to
 # write to) -- but this app calls print() extensively throughout for
 # logging/debugging. Without this guard, the very first print() call would
 # crash the app instantly with "AttributeError: 'NoneType' object has no
-# attribute 'write'", before the GUI even has a chance to open. Redirecting
-# to os.devnull makes every print() a harmless no-op instead. Must run
-# before any other import that might print something at import time.
+# attribute 'write'", before the GUI even has a chance to open.
+#
+# v10.17 FIX: the original os.devnull redirect below looked safe but
+# wasn't -- open(os.devnull, "w") still uses the OS default text encoding
+# (cp1252 on most Vietnamese/Windows installs), and print() encodes the
+# string BEFORE the (discarded) write happens. Any Vietnamese diacritic
+# (any char outside cp1252, e.g. '\u1ebf' = 'ế') in an f-string passed to
+# print() then raised UnicodeEncodeError and crashed the whole app at
+# import time -- same failure whether running the raw .py in a plain
+# Windows console (cp1252 by default there too) or the frozen --noconsole
+# exe. Forcing UTF-8 with errors="replace" on stdout/stderr fixes BOTH
+# cases: real console output now prints Vietnamese correctly, and the
+# devnull/log target can no longer choke on it either.
 if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
+    sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+else:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+    sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+else:
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        sys.stderr = _io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import math
 import json
@@ -22,6 +43,25 @@ import configparser
 import tkinter as tk
 from tkinter import messagebox, ttk, filedialog
 import webbrowser
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUILD FLAG — AI Search (offline embedding: Jina/BGE) + Vietnamese
+# diacritics restoration + OCR image indexing.
+#
+# Set to False for the "for friends / nonDS" build that ships without
+# torch/transformers/sentence_transformers/easyocr baked in (keeps the exe
+# small — no need to remove any code). When False:
+#   - The "🤖 AI Search" button and its model dropdown stay permanently
+#     greyed out (see _sync_ai_adv_lock), no matter what the ramp light says.
+#   - The "Search AI models" and "Vietnamese diacritics restoration"
+#     sections in the Update DB dialog are greyed out entirely.
+#   - BM25 search and AI Chat (online Gemini/Groq) are UNAFFECTED — this
+#     flag only touches the offline embedding-model features above.
+#
+# Set to True (default) for the internal/full build.
+# ═══════════════════════════════════════════════════════════════════════════
+ENABLE_AI_SEARCH_FEATURE = True
+
 import subprocess
 import re
 import sqlite3
@@ -1781,7 +1821,6 @@ PLACE_COLOR = "#8a8d93"
 HELP_CONTENT = {
     "EN": """
  [ Shortcuts / Commands ]
-  - abaqus cae / abq2026 cae   : Launch Abaqus CAE
   - --update data               : Manually update the database (search_data.db) — all Tier 1-4
   - --update data tier 1        : Update Tier 1 only (office/pdf)
   - --update data tier 1,2      : Update Tier 1 and Tier 2 only (comma/space separated, multiple OK)
@@ -1792,15 +1831,6 @@ HELP_CONTENT = {
  [ File / Folder Name Search ]
   - keyword               : Search file content / file name / folder name
   - space                 : Multiple keywords (AND search)
-
- [ Smart Suggestion (typo correction) ]
-  - 0 results found        : A suggested keyword automatically appears right
-                              below the Searchbox (e.g. "simpack reaktime" → "simpack realtime")
-  - Click the suggestion    : Instantly fills the Searchbox with it and re-searches —
-                              no confirmation needed, nothing is ever applied without a click
-  - How it works            : Tries fast local fuzzy matching first (🔎); if that finds
-                              nothing plausible, falls back to a single AI call (✨)
-  - Ignored?                : Suggestion auto-closes after 15s, or as soon as you type again
 
  [ Search Results ]
   - Double-click           : Open the file's location in Explorer
@@ -1853,7 +1883,6 @@ HELP_CONTENT = {
 """,
     "VI": """
  [ Phím tắt / Lệnh ]
-  - abaqus cae / abq2026 cae   : Mở Abaqus CAE
   - --update data               : Cập nhật thủ công database (search_data.db) — toàn bộ Tier 1-4
   - --update data tier 1        : Chỉ cập nhật Tier 1 (office/pdf)
   - --update data tier 1,2      : Chỉ cập nhật Tier 1 và Tier 2 (cách nhau bằng dấu phẩy/khoảng trắng, nhiều tier OK)
@@ -1864,15 +1893,6 @@ HELP_CONTENT = {
  [ Tìm File / Folder theo tên ]
   - từ khoá               : Tìm theo nội dung file / tên file / tên folder
   - dấu cách              : Nhiều từ khoá (tìm kiểu AND)
-
- [ Gợi ý thông minh (sửa lỗi gõ sai) ]
-  - Tìm 0 kết quả          : Chữ gợi ý tự động hiện ngay bên dưới ô Search
-                              (VD "simpack reaktime" → "simpack realtime")
-  - Bấm vào gợi ý           : Tự điền vào ô Search và tìm lại ngay —
-                              không cần xác nhận, không tự áp dụng nếu chưa bấm
-  - Cách hoạt động          : Thử tìm bằng fuzzy cục bộ trước (🔎, nhanh, miễn phí);
-                              nếu không ra gợi ý hợp lý mới gọi AI (✨)
-  - Không bấm thì sao?      : Gợi ý tự tắt sau 15s, hoặc tắt ngay khi bạn gõ tiếp
 
  [ Kết quả tìm kiếm ]
   - Double-click            : Mở vị trí file trong Explorer
@@ -1926,7 +1946,6 @@ HELP_CONTENT = {
 """,
     "JA": """
  [ ショートカット／コマンド ]
-  - abaqus cae / abq2026 cae   : Abaqus CAE を起動
   - --update data               : データベース(search_data.db)を手動更新 — Tier 1〜4 すべて
   - --update data tier 1        : Tier 1 のみ更新（office/pdf）
   - --update data tier 1,2      : Tier 1・2 のみ更新（カンマ/スペース区切り、複数指定可）
@@ -1937,15 +1956,6 @@ HELP_CONTENT = {
  [ ファイル／フォルダ名検索 ]
   - キーワード             : ファイル内容／ファイル名／フォルダ名で検索
   - スペース               : 複数キーワード（AND 検索）
-
- [ スマート候補（誤字補正） ]
-  - 検索結果 0 件            : 検索欄のすぐ下に候補キーワードが自動表示される
-                              （例："simpack reaktime" → "simpack realtime"）
-  - 候補をクリック            : 検索欄に自動入力されて即再検索 —
-                              確認は不要、クリックしない限り何も適用されない
-  - 仕組み                  : まずローカルの高速ファジー照合を試行（🔎）。
-                              妥当な候補がなければ AI に1回だけ問い合わせる（✨）
-  - 放置した場合             : 15秒後に自動で消える、または再入力した時点で消える
 
  [ 検索結果 ]
   - ダブルクリック           : Explorer でファイルの場所を開く
@@ -2462,10 +2472,11 @@ ONLINE_GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 # xoá cache client + reset cờ rate-limited nên không cần khởi động lại app.
 #
 # Fix bổ sung ở đây: nếu CẢ biến môi trường LẪN DB đều trống (cài mới,
-# hoặc vừa bấm "Delete API Key"), rơi về ĐÚNG key hard-code y hệt v4.0 làm
-# phương án cuối -- để hành vi mặc định của 2 bản giống hệt nhau, thay vì
-# v9.5 báo "Thiếu GEMINI_API_KEY" trong khi v4.0 vẫn chạy được.
-_GEMINI_API_KEY_HARDCODED_FALLBACK = "AQ.XXX"
+# hoặc vừa bấm "Delete API Key"), ONLINE_GEMINI_API_KEY ở lại rỗng --
+# _online_ai_available() sẽ báo "chưa có key", và người dùng cần tự nhập
+# key của mình qua nút "🔑 Update API" (hoặc biến môi trường GEMINI_API_KEY)
+# trước khi dùng AI Chat online. Không còn hard-code sẵn 1 key thật trong
+# code nữa (để repo có thể public/lên GitHub an toàn).
 
 
 def _ensure_settings_table():
@@ -2505,12 +2516,10 @@ def _load_api_keys_from_db():
               "Update API' để kiểm tra/xoá/đổi key này.")
     if not ONLINE_GROQ_API_KEY and rows.get("groq_api_key"):
         ONLINE_GROQ_API_KEY = rows["groq_api_key"]
-    # v-fix (yêu cầu 1): fallback cuối cùng khi cả env var lẫn DB đều trống
-    # -- xem comment đầy đủ tại nơi khai báo _GEMINI_API_KEY_HARDCODED_FALLBACK.
-    if not ONLINE_GEMINI_API_KEY:
-        ONLINE_GEMINI_API_KEY = _GEMINI_API_KEY_HARDCODED_FALLBACK
-        print("[Settings] GEMINI_API_KEY: không có biến môi trường / không có "
-              "key nào lưu trong DB -- dùng key mặc định hard-code (giống v4.0).")
+    # v-fix (yêu cầu 1): trước đây có 1 key hard-code làm fallback cuối
+    # cùng khi cả env var lẫn DB đều trống -- đã bỏ (không hard-code key
+    # thật trong code nữa). Nếu vẫn trống tới đây, ONLINE_GEMINI_API_KEY
+    # ở lại "" và _online_ai_available() sẽ báo thiếu key cho người dùng.
 
 
 def _save_api_keys_to_db(gemini_key=None, groq_key=None):
@@ -2582,10 +2591,10 @@ def _delete_api_keys_from_db(clear_gemini=True, clear_groq=True):
         conn = sqlite3.connect(DB_FILE, timeout=5)
         if clear_gemini:
             conn.execute("DELETE FROM settings WHERE key = 'gemini_api_key'")
-            # v-fix (yêu cầu 1): sau khi xoá key đã lưu trong DB, rơi về
-            # đúng key hard-code mặc định (giống v4.0) thay vì chuỗi rỗng --
-            # nhất quán với _load_api_keys_from_db() ở trên.
-            ONLINE_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or _GEMINI_API_KEY_HARDCODED_FALLBACK
+            # v-fix (yêu cầu 1): trước đây rơi về key hard-code mặc định
+            # sau khi xoá key trong DB -- đã bỏ hard-code, giờ rơi về
+            # chuỗi rỗng (hoặc biến môi trường nếu có).
+            ONLINE_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
             _online_gemini_client = None
         if clear_groq:
             conn.execute("DELETE FROM settings WHERE key = 'groq_api_key'")
@@ -5415,11 +5424,6 @@ class RealtimeSmartSearchApp:
         # xem _config_set("Models","chat_ai_model",...) trong _on_model_pick.
         _saved_chat_model = _config_get("Models", "chat_ai_model")
         self._chat_preferred_model = _saved_chat_model if _saved_chat_model in ONLINE_AI_MODELS else DEFAULT_ONLINE_MODEL
-        # v-new: "Did you mean" search suggestions -- see
-        # _maybe_suggest_correction / _get_fuzzy_vocab / _show_search_suggestion.
-        self._fuzzy_vocab_cache = None
-        self._fuzzy_vocab_building = False
-        self._suggestion_popup = None
         self._chat_auto_sent_for = None                  # query string already auto-summarized (avoid repeats)
         self._chat_citation_paths = []   # v-fix (Vấn đề 2): [N] -> path CỐ ĐỊNH trong suốt 1 phiên chat -- xem _online_chat_worker
         # v-fix (session_id collision): this used to always start at 1 on
@@ -6501,7 +6505,7 @@ class RealtimeSmartSearchApp:
             is_blue = False
         updating = bool(getattr(self, "_update_db_running", False))
         adv_state = "normal" if is_ready else "disabled"
-        ai_ready = is_blue and not updating
+        ai_ready = is_blue and not updating and ENABLE_AI_SEARCH_FEATURE
         ai_state = "normal" if ai_ready else "disabled"
         combo_state = "readonly" if ai_ready else "disabled"
         try:
@@ -7367,11 +7371,6 @@ class RealtimeSmartSearchApp:
                 except Exception as _e4: print(f"[Semantic] placeholder update failed: {_e4}")
                 try: self._sync_ai_adv_lock()  # belt-and-suspenders re-sync
                 except Exception as _e5: print(f"[Semantic] _sync_ai_adv_lock failed: {_e5}")
-                # v-new: filenames may have changed this run -- drop the
-                # cached fuzzy-correction vocabulary so the NEXT 0-result
-                # search rebuilds it fresh (see _get_fuzzy_vocab) instead of
-                # missing newly-indexed words.
-                self._fuzzy_vocab_cache = None
                 # v-new: "Update DB completed" summary popup -- what ran,
                 # when it started/ended, how long it took. Shown last, after
                 # everything above has already unlocked the UI, so the popup
@@ -7402,10 +7401,6 @@ class RealtimeSmartSearchApp:
         # so it waits for a real pause instead of reacting to the very
         # first settled word of a multi-word JP query.
         self._last_keystroke_ts = time.time()
-        # v-new: any real keystroke invalidates whatever "Did you mean"
-        # suggestion (see _show_search_suggestion) was showing for the
-        # PREVIOUS query -- it no longer applies to what's in the box now.
-        self._hide_search_suggestion()
         q = self.entry_var.get().strip()
 
         if len(q) < 1:
@@ -7500,142 +7495,6 @@ class RealtimeSmartSearchApp:
                 args=(q, search_version, box_x, box_y, box_h, False), daemon=True
             ).start())
 
-    def _get_fuzzy_vocab(self):
-        """Lazily-built, in-memory cache of every distinct filename word
-        token (lowercased, >=4 chars) across the whole DB -- the pool
-        local fuzzy-correction (_fuzzy_correct_tokens) matches typos
-        against. Building it means scanning the `files` table once, which
-        can take a few seconds on a large DB, so it's done in a background
-        thread the FIRST time it's needed (a 0-result search) rather than
-        blocking that search -- this call returns None immediately while
-        the build is in flight, meaning fuzzy-correction is simply skipped
-        for that one occurrence and falls through to the AI suggestion
-        path instead; every 0-result search after that uses the (by then
-        ready, cached) vocabulary. Rebuilt after every Update DB run (see
-        indexing_worker's _finish) since new files may introduce new valid
-        words that should stop being "corrected" away."""
-        vocab = getattr(self, "_fuzzy_vocab_cache", None)
-        if vocab is not None:
-            return vocab
-        if getattr(self, "_fuzzy_vocab_building", False):
-            return None
-        self._fuzzy_vocab_building = True
-
-        def _build():
-            v = set()
-            try:
-                import re as _re_fz
-                conn = sqlite3.connect(DB_FILE, timeout=5)
-                c = conn.cursor()
-                c.execute("SELECT name FROM files")
-                for (name,) in c.fetchall():
-                    if not name:
-                        continue
-                    for tok in _re_fz.split(r"[^\w]+", name.lower()):
-                        if len(tok) >= 4 and not tok.isdigit():
-                            v.add(tok)
-                conn.close()
-                print(f"[Fuzzy] vocabulary ready: {len(v)} distinct filename tokens")
-            except Exception as _e:
-                print(f"[Fuzzy] vocabulary build failed: {_e}")
-            self._fuzzy_vocab_cache = v
-            self._fuzzy_vocab_building = False
-
-        threading.Thread(target=_build, daemon=True).start()
-        return None
-
-    def _fuzzy_correct_tokens(self, kw, vocab):
-        """For each search token not already present verbatim in `vocab`,
-        look for a close match (Levenshtein-ish ratio via difflib, no
-        extra dependency needed) and substitute it in. Returns the
-        corrected token list, or None if nothing needed changing (kept
-        distinct from returning the unchanged list so callers can tell
-        "no correction available" apart from "checked, all fine")."""
-        import difflib
-        corrected = []
-        changed = False
-        for tok in kw:
-            if len(tok) < 4 or tok in vocab:
-                corrected.append(tok)
-                continue
-            matches = difflib.get_close_matches(tok, vocab, n=1, cutoff=0.78)
-            if matches and matches[0] != tok:
-                corrected.append(matches[0])
-                changed = True
-            else:
-                corrected.append(tok)
-        return corrected if changed else None
-
-    def _maybe_suggest_correction(self, query, kw, version, box_x, box_y, box_h):
-        """0 results for `query` (both File Name/Folder Name AND File
-        Content came back empty) -- try local fuzzy correction first
-        (instant, free); only escalate to a single AI call if fuzzy has
-        nothing to offer either. Never applies anything by itself -- only
-        shows the suggested keyword directly under the search box, which
-        the user has to click to apply (see _show_search_suggestion)."""
-        if version != self.current_search_id:
-            return  # user has since moved on -- don't suggest for an abandoned query
-        try:
-            vocab = self._get_fuzzy_vocab()
-            corrected = self._fuzzy_correct_tokens(kw, vocab) if vocab else None
-        except Exception as _e:
-            print(f"[Fuzzy] correction attempt failed: {_e}")
-            corrected = None
-        if corrected:
-            self._show_search_suggestion(query, " ".join(corrected), "fuzzy", box_x, box_y, box_h)
-            return
-        # Local fuzzy match found nothing plausible -- fall back to a
-        # single AI call (Gemini/GPT-OSS, whichever is currently selected
-        # for AI Chat -- see self._chat_preferred_model) for a suggestion.
-        threading.Thread(target=self._ai_suggest_correction_worker,
-                          args=(query, version, box_x, box_y, box_h), daemon=True).start()
-
-    def _ai_suggest_correction_worker(self, query, version, box_x, box_y, box_h):
-        """Background worker: ask the online AI for a single best-guess
-        corrected/likely-intended search term for a query that returned 0
-        results AND that local fuzzy-matching couldn't fix either (e.g. no
-        diacritics rather than a typo, or a typo severe enough that
-        difflib's similarity cutoff missed it). One API call, plain-text
-        response expected (no JSON/markdown), never auto-applied. Reuses
-        _call_online_ai (same function _online_chat_worker uses) so this
-        gets the same rate-limit-aware Gemini<->GPT-OSS fallback behavior
-        for free instead of duplicating that logic."""
-        try:
-            system_prompt = (
-                "You correct queries typed into a LOCAL FILE SEARCH engine "
-                "(filenames/folder names/document content on a Windows PC, "
-                "often engineering/office files, sometimes Vietnamese without "
-                "diacritics). Reply with ONLY the corrected query text, nothing "
-                "else -- no explanation, no quotes, no markdown. If you can't "
-                "confidently improve it, reply with exactly the same text "
-                "unchanged."
-            )
-            user_prompt = f'This query found ZERO results: "{query}"'
-            model_choice = getattr(self, "_chat_preferred_model", DEFAULT_ONLINE_MODEL)
-            suggestion, err = _call_online_ai(model_choice, system_prompt, user_prompt)
-            if err and _is_online_ai_rate_limit_err(err):
-                # v-new: chain through the other 2 models (not just 1 fixed
-                # alt) now that there are 3 -- see MODEL_FALLBACK_ORDER.
-                for alt in MODEL_FALLBACK_ORDER:
-                    if alt == model_choice:
-                        continue
-                    suggestion, err = _call_online_ai(alt, system_prompt, user_prompt)
-                    if not (err and _is_online_ai_rate_limit_err(err)):
-                        break
-            if not suggestion:
-                if err:
-                    print(f"[AI Suggest] correction request failed: {err}")
-                return
-            suggestion = suggestion.strip().strip('"').strip()
-            if not suggestion or suggestion.lower() == query.strip().lower():
-                return  # AI had nothing better to offer
-            if version != self.current_search_id:
-                return  # user has since moved on
-            self.root.after(0, lambda: self._show_search_suggestion(
-                query, suggestion, "ai", box_x, box_y, box_h))
-        except Exception as _e:
-            print(f"[AI Suggest] correction request failed: {_e}")
-
     def _search_bar_box_h(self):
         """v-fix: height of just the persistent top search-bar row
         (self.bg_f, fixed height=35 -- see __init__), NOT the whole window.
@@ -7643,73 +7502,14 @@ class RealtimeSmartSearchApp:
         show_results: "results now render inside THIS SAME window
         (self.root)") -- so self.root.winfo_height() at that point returns
         the height of the entire (tall, ~930px) results window instead of
-        just the search bar. That was pushing the fuzzy-suggestion popup
-        all the way down to the bottom of the results window instead of
-        right under the Searchbox keyword. bg_f's height never changes
-        (idle vs results mode), so using it here always gives the right
-        offset regardless of whether results are currently showing."""
+        just the search bar. bg_f's height never changes (idle vs results
+        mode), so using it here always gives the right offset regardless
+        of whether results are currently showing."""
         try:
             h = self.bg_f.winfo_height()
             return h if h > 1 else 35
         except Exception:
             return 35
-
-    def _show_search_suggestion(self, original_query, suggestion, source, box_x, box_y, box_h):
-        """Small floating suggestion shown under the search bar when a
-        0-result query got a plausible correction (source is "fuzzy" or
-        "ai", just changes the icon). v-new: shows ONLY the suggested
-        keyword itself -- no "Did you mean...?" question, no separate
-        "Apply" wording -- so it reads like an instant autocomplete hint
-        rather than something the user has to confirm. A standalone
-        Toplevel rather than something nested inside the (large, complex)
-        results window, so it can't collide with that window's own layout.
-        Auto-closes on the next keystroke (see on_key_release) or after
-        15s if ignored. Clicking it fills the Searchbox with the suggested
-        text and re-runs the search -- exactly as if the user had typed it
-        themselves; it is still never applied automatically without a
-        click, just no question is asked first."""
-        try:
-            self._hide_search_suggestion()
-            win = tk.Toplevel(self.root)
-            win.overrideredirect(True)
-            try:
-                win.attributes("-topmost", True)
-            except Exception:
-                pass
-            bg = "#2a2a1a" if source == "fuzzy" else "#132a3a"
-            win.configure(bg=bg)
-            icon = "🔎" if source == "fuzzy" else "✨"
-            btn = tk.Label(win, text=f'{icon}  {suggestion}', bg=bg,
-                            fg="#7ec8e3", font=("Segoe UI", 9, "bold"),
-                            cursor="hand2", anchor="w", padx=8, pady=5)
-            btn.pack(fill="x")
-
-            def _apply(event=None):
-                self._hide_search_suggestion()
-                self.entry_var.set(suggestion)
-                try:
-                    self.entry.icursor("end")
-                except Exception:
-                    pass
-                self._rerun_current_search()
-
-            btn.bind("<Button-1>", _apply)
-            win.bind("<Button-1>", _apply)
-            win.update_idletasks()
-            win.geometry(f"+{box_x + 10}+{box_y + box_h + 4}")
-            self._suggestion_popup = win
-            win.after(15000, self._hide_search_suggestion)
-        except Exception as _e:
-            print(f"[Suggestion] show failed: {_e}")
-
-    def _hide_search_suggestion(self):
-        try:
-            w = getattr(self, "_suggestion_popup", None)
-            if w is not None and w.winfo_exists():
-                w.destroy()
-        except Exception:
-            pass
-        self._suggestion_popup = None
 
     def _rerun_current_search(self):
         """v7.10: re-run the search currently in the box with the SAME text
@@ -13158,18 +12958,6 @@ class RealtimeSmartSearchApp:
                 # là an toàn, không spam.
                 self.root.after(0, self._show_online_chat_panel)
                 self.root.after(150, lambda: self._auto_ai_chat_after_search(q))
-                # v-new: "Did you mean" suggestions -- see
-                # _maybe_suggest_correction. Only for a genuinely empty
-                # result set on the settled query (never mid-typing), and
-                # only file_res/cont_res -- the mail/notes merge below can
-                # still add results a bit later for the SAME version, so
-                # this only fires when there was nothing here already
-                # instead of racing ahead of that merge.
-                if not file_res and not cont_res:
-                    self.root.after(500, lambda: self._maybe_suggest_correction(
-                        cleaned_q, kw, version, box_x, box_y, box_h))
-                else:
-                    self.root.after(0, self._hide_search_suggestion)
                 # Kick off the (potentially slow) Outlook/OneNote merge only
                 # AFTER the fast render above has already been scheduled --
                 # it appends mail/notes hits in a follow-up refresh once ready.
@@ -13327,7 +13115,6 @@ class RealtimeSmartSearchApp:
             self._last_bm25_cont_res = cont_res
             print(f"[Timing] _sort_priority merge took {time.time()-_t_sort0:.2f}s -- "
                   f"{len(mail_res)} mail/notes rows, total elapsed so far {time.time()-_t0:.2f}s")
-            self.root.after(0, self._hide_search_suggestion)  # mail/notes turned up results after all -- any "did you mean" no longer applies
             _t_ui0 = time.time()
             self.root.after(0, lambda: (
                 self.update_or_show_results(
@@ -13583,33 +13370,26 @@ class RealtimeSmartSearchApp:
 
         q_norm = unicodedata.normalize('NFKC', q_norm)
 
-        if re.match(r"^(abaqus|abq\d{4})\s+cae$", q_norm, re.I):
-            try:
-                # cmd /c start launches detached, finds abaqus in PATH, opens GUI
-                subprocess.Popen(f'cmd /c start "" {q_norm}', shell=True, close_fds=True)
-            except Exception as e:
-                messagebox.showerror("Launch Error", f"Cannot launch: {q_norm}\n{e}")
-        else:
-            # v3.4 FIX: this used to just .lift() the window and do nothing
-            # else whenever active_result_win already existed — harmless when
-            # Enter is pressed after typing (on_key_release's debounce had
-            # already fired the real search on keystrokes), but silently
-            # broken for any caller that sets entry_var programmatically and
-            # calls handle_action() directly without going through
-            # <KeyRelease> first — e.g. "Search again" from History, which
-            # left the keyword sitting in the box with no results ever
-            # fetched. Now this branch always launches a fresh search itself
-            # (same calls on_key_release makes), and additionally lifts the
-            # window to the front if one was already open.
-            if self.active_result_win and tk.Toplevel.winfo_exists(self.active_result_win):
-                self.active_result_win.lift()
-            self.current_search_id += 1; self.root.update_idletasks()
-            box_x, box_y, box_h = self.root.winfo_x(), self.root.winfo_y(), self._search_bar_box_h()
-            threading.Thread(target=self._mft_scan_search, args=(
-                q_norm, self.current_search_id, box_x, box_y, box_h), daemon=True).start()
-            if self.db_conn is not None:
-                threading.Thread(target=self._smart_search_realtime, args=(
-                    q_norm, self.current_search_id, box_x, box_y, box_h, False), daemon=True).start()
+        # v3.4 FIX: this used to just .lift() the window and do nothing
+        # else whenever active_result_win already existed — harmless when
+        # Enter is pressed after typing (on_key_release's debounce had
+        # already fired the real search on keystrokes), but silently
+        # broken for any caller that sets entry_var programmatically and
+        # calls handle_action() directly without going through
+        # <KeyRelease> first — e.g. "Search again" from History, which
+        # left the keyword sitting in the box with no results ever
+        # fetched. Now this branch always launches a fresh search itself
+        # (same calls on_key_release makes), and additionally lifts the
+        # window to the front if one was already open.
+        if self.active_result_win and tk.Toplevel.winfo_exists(self.active_result_win):
+            self.active_result_win.lift()
+        self.current_search_id += 1; self.root.update_idletasks()
+        box_x, box_y, box_h = self.root.winfo_x(), self.root.winfo_y(), self._search_bar_box_h()
+        threading.Thread(target=self._mft_scan_search, args=(
+            q_norm, self.current_search_id, box_x, box_y, box_h), daemon=True).start()
+        if self.db_conn is not None:
+            threading.Thread(target=self._smart_search_realtime, args=(
+                q_norm, self.current_search_id, box_x, box_y, box_h, False), daemon=True).start()
 
     # ── Priority sort helpers ──────────────────────────────────────────────────
     # v2.5: user-defined 4-tier system — used for BOTH (a) the order files are
@@ -14977,6 +14757,8 @@ class RealtimeSmartSearchApp:
             command=_on_ai_search)
         self._ai_search_btn.pack(side="right", padx=(4, 2), pady=4)
         def _ai_search_btn_tooltip_text():
+            if not ENABLE_AI_SEARCH_FEATURE:
+                return "AI Search is disabled in this build."
             return "AI-powered semantic search (slower, smarter). Click again anytime to re-run."
         add_tooltip(self._ai_search_btn, _ai_search_btn_tooltip_text)
 
@@ -15601,11 +15383,14 @@ class RealtimeSmartSearchApp:
             # the same kind of choice: "what content gets extracted".
             ocr_var = tk.BooleanVar(value=False)
             ocr_cb = tk.Checkbutton(
-                tiers_f, text="OCR images (.jpg/.png/...) — slower, downloads OCR model on first use",
+                tiers_f, text=("OCR images (.jpg/.png/...) — slower, downloads OCR model on first use"
+                               if ENABLE_AI_SEARCH_FEATURE else
+                               "OCR images (disabled in this build — requires torch, not bundled)"),
                 variable=ocr_var, bg=BG_COLOR, anchor="w",
-                font=("Segoe UI", 9), justify="left", wraplength=460)
+                font=("Segoe UI", 9), justify="left", wraplength=460,
+                state=("normal" if ENABLE_AI_SEARCH_FEATURE else "disabled"))
             ocr_cb.pack(fill="x", anchor="w", pady=(6, 2))
-            _greyable.append((ocr_cb, "normal"))
+            _greyable.append((ocr_cb, "normal" if ENABLE_AI_SEARCH_FEATURE else "disabled"))
 
             # v-new: "Force re-index" -- var defined here alongside the
             # other extraction-related checkboxes, but the actual widget is
@@ -15620,7 +15405,8 @@ class RealtimeSmartSearchApp:
             # unchecking a model skips its (slow) embedding pass entirely,
             # e.g. if the user only ever uses Jina-v3 and doesn't care about
             # BGE-Gemma2, unchecking it noticeably speeds up Update DB.
-            ai_f = tk.LabelFrame(dlg, text="Search AI models",
+            ai_f = tk.LabelFrame(dlg, text=("Search AI models" if ENABLE_AI_SEARCH_FEATURE
+                                             else "Search AI models (disabled in this build)"),
                                   bg=BG_COLOR, fg="#33363c",
                                   font=("Segoe UI", 9, "bold"), padx=10, pady=8)
             ai_f.pack(fill="x", padx=12, pady=(0, 6))
@@ -15641,14 +15427,19 @@ class RealtimeSmartSearchApp:
                 # re-enabled automatically the moment install succeeds (see
                 # _install_model_online's _ok()) without needing to reopen
                 # this dialog.
-                mv = tk.BooleanVar(value=installed)
+                #
+                # v10.17 (ENABLE_AI_SEARCH_FEATURE=False build): force this
+                # whole section unchecked + disabled regardless of what's
+                # installed on disk — see the flag's definition near the top
+                # of the file for what this build variant is for.
+                mv = tk.BooleanVar(value=(installed and ENABLE_AI_SEARCH_FEATURE))
                 model_var_list.append((model_key, mv))
                 cb = tk.Checkbutton(row, text=f"Build embeddings for {label}",
                                      variable=mv, bg=BG_COLOR, font=("Segoe UI", 9),
-                                     state=("normal" if installed else "disabled"),
+                                     state=("normal" if (installed and ENABLE_AI_SEARCH_FEATURE) else "disabled"),
                                      disabledforeground="#a0a0a0")
                 cb.pack(side="left")
-                _greyable.append((cb, "normal" if installed else "disabled"))
+                _greyable.append((cb, "normal" if (installed and ENABLE_AI_SEARCH_FEATURE) else "disabled"))
 
                 status_txt = ("✓ installed" if installed else "not installed locally")
                 status_fg = "#4caf50" if installed else "#888888"
@@ -15662,12 +15453,19 @@ class RealtimeSmartSearchApp:
                 # button would make it impossible to try installing again.
                 # Always clickable so the user can (re)install / overwrite
                 # at any time.
+                #
+                # v10.17: EXCEPT in the ENABLE_AI_SEARCH_FEATURE=False build,
+                # where there's no torch/sentence_transformers baked into the
+                # exe to ever load an installed model with anyway — so the
+                # install button is disabled here too instead of offering a
+                # download that would just sit unused.
                 install_btn = tk.Button(row, text=("Reinstall..." if installed else "Install online..."),
-                                         font=("Segoe UI", 8), cursor="hand2", state="normal")
+                                         font=("Segoe UI", 8), cursor="hand2",
+                                         state=("normal" if ENABLE_AI_SEARCH_FEATURE else "disabled"))
                 install_btn.config(command=lambda mk=model_key, sl=status_lbl, ib=install_btn, ckb=cb, mvv=mv:
                                     _install_model_online(mk, sl, ib, dlg, ckb, mvv))
                 install_btn.pack(side="right")
-                _greyable.append((install_btn, "normal"))
+                _greyable.append((install_btn, "normal" if ENABLE_AI_SEARCH_FEATURE else "disabled"))
 
 
 
@@ -15675,7 +15473,8 @@ class RealtimeSmartSearchApp:
             # the embedding models above — this is a query-preprocessing
             # helper, not something you pick for search, so no "build
             # embeddings" checkbox here, just install status) ─────────────
-            vidia_f = tk.LabelFrame(dlg, text="Vietnamese diacritics restoration (optional)",
+            vidia_f = tk.LabelFrame(dlg, text=("Vietnamese diacritics restoration (optional)" if ENABLE_AI_SEARCH_FEATURE
+                                                else "Vietnamese diacritics restoration (disabled in this build)"),
                                      bg=BG_COLOR, fg="#33363c",
                                      font=("Segoe UI", 9, "bold"), padx=10, pady=8)
             vidia_f.pack(fill="x", padx=12, pady=(0, 6))
@@ -15691,11 +15490,12 @@ class RealtimeSmartSearchApp:
             vidia_status_lbl.pack(side="left", padx=(8, 0))
             vidia_install_btn = tk.Button(
                 vidia_row, text=("Reinstall..." if vidia_installed else "Install online..."),
-                font=("Segoe UI", 8), cursor="hand2", state="normal")
+                font=("Segoe UI", 8), cursor="hand2",
+                state=("normal" if ENABLE_AI_SEARCH_FEATURE else "disabled"))
             vidia_install_btn.config(
                 command=lambda: _install_vi_diacritics_online(vidia_status_lbl, vidia_install_btn, dlg))
             vidia_install_btn.pack(side="right")
-            _greyable.append((vidia_install_btn, "normal"))
+            _greyable.append((vidia_install_btn, "normal" if ENABLE_AI_SEARCH_FEATURE else "disabled"))
 
             def _on_mail_notes_toggle(*_a):
                 locked = (outlook_only_var.get() or onenote_only_var.get()) and not chain_all_var.get()
