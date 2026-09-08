@@ -1,11 +1,20 @@
 name: Build SmartSearchAI.exe
 
-# Runs on every push to main, and can also be triggered manually from the
-# Actions tab (the "Run workflow" button) without needing a push.
+# Runs on every push to main (build+test only, no public link), AND on
+# pushing a version tag like "v1.0" (build + also publish a public Release
+# with a direct download link -- see the last two steps below). Can also
+# be triggered manually from the Actions tab ("Run workflow" button); a
+# manual run behaves like a push to main (Artifact only, no Release).
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch: {}
+
+# Needed for the "Publish GitHub Release" step below to be allowed to
+# create a release -- the default GITHUB_TOKEN is read-only otherwise.
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -28,7 +37,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+        # pyinstaller + pyinstaller-hooks-contrib are already listed inside
+        # requirements.txt itself now -- no separate "pip install
+        # pyinstaller" line needed here anymore.
 
       - name: Build exe with PyInstaller
         run: |
@@ -43,3 +54,18 @@ jobs:
           # thing; upload-artifact zips it automatically for download.
           path: dist/SmartSearchAI/
           compression-level: 6
+
+      # Everything below only runs when this workflow was triggered by
+      # pushing a version TAG (e.g. `git tag v1.0 && git push origin v1.0`)
+      # -- NOT on a plain push to main, and NOT on a manual "Run workflow"
+      # click. This is what gives friends a public, no-login-required
+      # download link, unlike the Artifact above.
+      - name: Zip build folder for release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: Compress-Archive -Path dist/SmartSearchAI/* -DestinationPath SmartSearchAI-windows.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SmartSearchAI-windows.zip
