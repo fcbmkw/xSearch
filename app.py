@@ -5998,6 +5998,13 @@ class RealtimeSmartSearchApp:
                 size = os.path.getsize(path)
                 name = os.path.basename(path)
                 mtime = os.path.getmtime(path)
+                # v10.19 FIX: sanitize path/name/content AFTER the real
+                # filesystem calls above (getsize/getmtime need the raw,
+                # unmodified path to actually find the file on disk) but
+                # BEFORE anything goes into SQLite -- see _sanitize_utf8.
+                name = self._sanitize_utf8(name)
+                path = self._sanitize_utf8(path)
+                content = self._sanitize_utf8(content)
                 c.execute("INSERT OR REPLACE INTO files (type, name, path, size) VALUES (?,?,?,?)",
                           ("File", name, path, size))
                 c.execute("INSERT OR REPLACE INTO content_store (path, content, mtime) VALUES (?,?,?)",
@@ -6094,6 +6101,28 @@ class RealtimeSmartSearchApp:
         if not result.get("ok"):
             return ""
         return result.get("val") or ""
+
+    @staticmethod
+    def _sanitize_utf8(s):
+        """v10.19 FIX: on Windows, os.walk/os.listdir can return a filename
+        containing a "lone surrogate" character (\\udc00-\\udfff) -- this
+        happens for the rare file whose name isn't valid UTF-16 on disk
+        (leftover from an old tool, a broken sync client, a different
+        filesystem mounted in, etc.). Python deliberately allows this in
+        path strings for filesystem round-tripping, but such a string
+        can NEVER be encoded to real UTF-8 -- not by sqlite3 (which
+        stores TEXT columns as UTF-8 internally), and not by anything
+        else that writes it out. Without this, ONE such file anywhere on
+        the drive would raise UnicodeEncodeError deep inside a batch
+        INSERT and silently abort the ENTIRE indexing run (all files
+        queued in that batch, not just the one bad file). Replacing the
+        unencodable character with U+FFFD keeps the file discoverable
+        (searchable by the rest of its name/content) instead of crashing
+        everything. Applied to any path/content string right before it's
+        queued for a SQLite INSERT -- see indexing_worker."""
+        if not isinstance(s, str):
+            return s
+        return s.encode("utf-8", errors="replace").decode("utf-8")
 
     def get_file_content(self, filepath, force_ocr=False):
         if not filepath: return ""
@@ -6837,8 +6866,23 @@ class RealtimeSmartSearchApp:
                 try: self.db_conn.close()
                 except: pass
                 self.db_conn = None
-            conn = sqlite3.connect(DB_FILE)
+            conn = sqlite3.connect(DB_FILE, timeout=30)
             c = conn.cursor()
+            # v10.19 FIX: this connection used to have no timeout at all
+            # (defaulted to sqlite3's built-in 5s) and never set WAL mode
+            # itself -- if self.db_conn (the persistent realtime-search
+            # reader, opened elsewhere with WAL already on) hadn't fully
+            # released its file handle yet (e.g. Windows still finishing a
+            # close() from a background search thread at the exact moment
+            # "Update DB" was clicked), the very first CREATE TABLE below
+            # could hit "database is locked" and abort the whole indexing
+            # run. WAL mode lets one writer and any number of readers work
+            # at the same time without blocking each other -- setting it
+            # here too (harmless/no-op if the file is already in WAL mode)
+            # plus a generous 30s timeout makes this connection wait out
+            # any brief contention instead of failing immediately.
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA busy_timeout=30000")
             c.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, query TEXT, date TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS files (type TEXT, name TEXT, path TEXT, size INTEGER)")
             c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS content_index USING fts5(path, content, tokenize='trigram case_sensitive 0')")
@@ -6990,7 +7034,9 @@ class RealtimeSmartSearchApp:
                             is_dir = item in dirs
                             
                             f_size = os.path.getsize(full_p) if not is_dir else 0
-                            batch_files.append(("Folder" if is_dir else "File", item, full_p, f_size))
+                            batch_files.append(("Folder" if is_dir else "File",
+                                                 self._sanitize_utf8(item),
+                                                 self._sanitize_utf8(full_p), f_size))
                             
                             if not is_dir:
                                 f_ext = os.path.splitext(full_p)[1].lower()
@@ -7102,7 +7148,15 @@ class RealtimeSmartSearchApp:
                 try:
                     content = self.get_file_content(full_p)
                     if content:
-                        batch_content.append((full_p, content, _cur_mtime))
+                        # v10.19 FIX: sanitize both path and content right
+                        # before they're queued for the SQLite INSERT below
+                        # -- see _sanitize_utf8 for why (a single file with
+                        # a lone-surrogate path, or extracted text that
+                        # somehow ends up with one, would otherwise crash
+                        # this WHOLE batch's INSERT and abort the run).
+                        batch_content.append((self._sanitize_utf8(full_p),
+                                               self._sanitize_utf8(content),
+                                               _cur_mtime))
                         _scan_new += 1
                 except Exception:
                     continue
@@ -7388,7 +7442,7 @@ class RealtimeSmartSearchApp:
             print(f"Indexing Error:\n{err}")
             try:
                 log_path = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), "search_error.log")
-                with open(log_path, "a", encoding="utf-8") as lf:
+                with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
                     from datetime import datetime as _dt
                     lf.write(f"\n[{_dt.now()}] INDEXING ERROR:\n{err}\n")
             except: pass
