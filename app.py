@@ -7329,47 +7329,21 @@ class RealtimeSmartSearchApp:
             conn.close()
             import time; time.sleep(0.5)  # let WAL checkpoint flush before reopening
 
-            # ── Outlook mail indexing (v-outlook) ───────────────────────────
-            # Runs as part of the same "Update DB" click so there's only one
-            # button for the user to remember — own db file, own try/except,
-            # so if Outlook isn't installed/running this just prints a note
-            # and the rest of Update DB continues unaffected.
-            if OUTLOOK_SEARCH_AVAILABLE:
-                try:
-                    try:
-                        self.root.after(0, lambda: self.placeholder.config(text="Indexing Outlook mail..."))
-                    except Exception:
-                        pass
-                    def _outlook_progress(done, total, subj):
-                        print(f"[Outlook] {done}/{total}: {subj}")
-                    o_indexed, o_skipped, o_err = outlook_search.index_outlook_mail(progress_cb=_outlook_progress)
-                    if o_err:
-                        print(f"[Outlook] Indexing skipped: {o_err}")
-                    else:
-                        print(f"[Outlook] Indexed {o_indexed} mail, skipped {o_skipped} unchanged.")
-                except Exception as _oe:
-                    print(f"[Outlook] Indexing failed: {_oe}")
-            # ─────────────────────────────────────────────────────────────
-
-            # ── OneNote indexing (v-onenote) ────────────────────────────────
-            # Same pattern as Outlook above — own db file, own try/except,
-            # runs as part of the same "Update DB" click.
-            if ONENOTE_SEARCH_AVAILABLE:
-                try:
-                    try:
-                        self.root.after(0, lambda: self.placeholder.config(text="Indexing OneNote..."))
-                    except Exception:
-                        pass
-                    def _onenote_progress(done, total, subj):
-                        print(f"[OneNote] {done}/{total}: {subj}")
-                    n_indexed, n_skipped, n_locked, n_err = onenote_search.index_onenote(progress_cb=_onenote_progress)
-                    if n_err:
-                        print(f"[OneNote] Indexing skipped: {n_err}")
-                    else:
-                        print(f"[OneNote] Indexed {n_indexed} page, skipped {n_skipped} unchanged, {n_locked} locked/unreadable.")
-                except Exception as _ne:
-                    print(f"[OneNote] Indexing failed: {_ne}")
-            # ─────────────────────────────────────────────────────────────
+            # v10.19 FIX: this used to unconditionally run Outlook mail +
+            # OneNote indexing right here, on EVERY Tier+AI "Update DB" run,
+            # completely ignoring the dedicated "Update Outlook mail" /
+            # "Update OneNote" checkboxes in the dialog (those checkboxes
+            # only control the SEPARATE _start_mail_notes_update() flow).
+            # Result: even with both checkboxes left unchecked and only
+            # Tier 1 + one AI model selected, Outlook/OneNote indexing ran
+            # anyway as an unskippable, unconditional side effect -- with a
+            # large mailbox this could silently run for hours after the
+            # "AI x/x: 100%" progress text had already stopped moving,
+            # looking exactly like a hang. Outlook/OneNote indexing is now
+            # ONLY triggered through their own dedicated checkboxes (see
+            # _start_mail_notes_update, index_outlook_mail/index_onenote) --
+            # removed from here entirely so a Tier+AI run does only what its
+            # own dialog said it would do.
 
             # ⚠️ VACUUM removed: 44GB DB needs ~88GB free disk + 30min → causes RED LIGHT
             # v3.5: Blue only once the currently selected AI model's embeddings
