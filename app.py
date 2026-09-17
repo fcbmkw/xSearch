@@ -1367,13 +1367,31 @@ _ONENOTE_SEARCH_SRC_B64 = (
 def _load_embedded_module(name, src_b64):
     """Recreate a standalone module from its embedded base64 source, in a
     way that's indistinguishable to the rest of this file from a normal
-    `import name`. __file__ is set to THIS script's own path (not a fake
-    one) so the embedded module's own `_BASE_DIR = os.path.dirname(...
-    __file__)` logic still resolves to the same folder as before (e.g.
-    E:/mySearch_ai/), keeping search_outlook.db / search_onenote.db in
-    exactly the same place they were when these were separate files."""
+    `import name`. __file__ is set so the embedded module's own
+    `_BASE_DIR = os.path.dirname(os.path.abspath(__file__))` logic
+    resolves to the same folder as before (e.g. E:/mySearch_ai/), keeping
+    search_outlook.db / search_onenote.db in exactly the same place they
+    were when these were separate files.
+
+    v10.24 FIX: this used to always set mod.__file__ = os.path.abspath
+    (__file__) -- i.e. THIS script's (app.py's) own __file__. That's
+    correct when running as a plain .py script, but wrong once frozen by
+    PyInstaller: a frozen script's own __file__ resolves to somewhere
+    under the temporary/internal extraction folder (sys._MEIPASS, e.g.
+    dist/SmartSearchAI/_internal/app.py in --onedir mode) -- NOT the same
+    folder as the actual .exe, which is exactly why THIS file's own
+    _BASE_DIR (see near the top) special-cases `sys.frozen` and uses
+    os.path.dirname(sys.executable) instead. Without the same special
+    case here, the embedded outlook_search/onenote_search modules'
+    _BASE_DIR silently resolved to that _internal subfolder instead of
+    next to the exe -- so search_outlook.db/search_onenote.db actually
+    got created and updated inside _internal (invisible unless you go
+    looking), while a stale copy sitting next to the exe from an earlier
+    .py-based run never got touched again, looking exactly like updates
+    "not saving" even though search results correctly reflected the
+    (hidden, inner) fresh data within that same running session."""
     mod = _mod_types.ModuleType(name)
-    mod.__file__ = os.path.abspath(__file__)
+    mod.__file__ = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     src = _b64.b64decode(src_b64).decode("utf-8")
     exec(compile(src, f"<embedded:{name}.py>", "exec"), mod.__dict__)
     return mod
