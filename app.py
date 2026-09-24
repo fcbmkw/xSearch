@@ -5805,7 +5805,8 @@ class RealtimeSmartSearchApp:
                 c.execute("SELECT count(*) FROM files")
                 if c.fetchone()[0] > 0: has_data = True
                 conn.close()
-            except: pass
+            except Exception as _e:
+                print(f"[Startup] DB check failed ({DB_FILE}): {_e}")
 
         if not db_exists:
             # Red: no database.db at all yet — user should run --update data
@@ -6852,8 +6853,12 @@ class RealtimeSmartSearchApp:
             # ── STAGE 1: File scan ────────────────────────────────────────────
             # File scan is fast (minutes) — always rerun fully to catch new/deleted/moved
             # files. Not the bottleneck, so no resume needed here.
-            c.execute("DROP TABLE IF EXISTS files")
-            c.execute("CREATE TABLE files (type TEXT, name TEXT, path TEXT, size INTEGER)")
+            # v10.20 FIX: do NOT drop `files` here. It used to be dropped and
+            # left empty until the whole (multi-hour) content extraction
+            # finished, so any interrupted run left search_data.db with a big
+            # content_store but an EMPTY files table -> ramp stayed Yellow,
+            # db_conn never opened, search returned nothing.
+            c.execute("CREATE TABLE IF NOT EXISTS files (type TEXT, name TEXT, path TEXT, size INTEGER)")
             c.execute("DROP TABLE IF EXISTS files_temp")
             c.execute("CREATE TABLE files_temp (type TEXT, name TEXT, path TEXT, size INTEGER)")
             # content_index (FTS5) + content_store are content caches — do NOT drop them.
@@ -7044,6 +7049,15 @@ class RealtimeSmartSearchApp:
             if batch_files: c.executemany("INSERT INTO files_temp VALUES (?,?,?,?)", batch_files)
             conn.commit()
 
+            # v10.20 FIX: files_temp is already complete after the scan, so
+            # publish it to `files` NOW (before slow content extraction).
+            c.execute("DELETE FROM files")
+            c.execute("INSERT INTO files SELECT * FROM files_temp")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_files_type ON files(type)")
+            conn.commit()
+
             # ── v2.5: extract content in tier order ──────────────────────────
             # Tier 1: office/pdf | Tier 2: msg/txt/log/one | Tier 3: scripts/
             # config/spck | Tier 4: markup/misc. Stable sort keeps files within
@@ -7089,7 +7103,6 @@ class RealtimeSmartSearchApp:
                 c.executemany("INSERT OR REPLACE INTO content_store VALUES (?,?,?)", batch_content)
                 conn.commit()
             print(f"[Scan] {_scan_total} files checked, {_scan_skipped} unchanged (skipped), {_scan_new} new/changed (re-extracted)")
-            c.execute("DELETE FROM files"); c.execute("INSERT INTO files SELECT * FROM files_temp")
             c.execute("DROP TABLE IF EXISTS files_temp")
             c.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)")
